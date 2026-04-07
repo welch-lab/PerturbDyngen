@@ -1,0 +1,463 @@
+---
+title: "Multie-time-identifibility-simulations"
+author: "wzqian"
+date: "2025-09-03"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+library(tidyverse)
+library(ggplot2)
+library(dplyr)
+library(patchwork)
+#library(lpSolve)
+library(progress)
+library(ROI)
+library(ROI.plugin.highs)
+library(glmnet)
+library(igraph)
+source("/nfs/turbo/umms-welchjd-code/code/wzqian/Casualformer/theory/theory_simulations_func.R")
+```
+
+
+```{r}
+# 1) 构图：将 ground truth + 时间矩阵 合成为加权邻接 wt
+build_weight_matrix <- function(graph_matrix, time_matrix) {
+  stopifnot(is.matrix(graph_matrix), is.matrix(time_matrix))
+  stopifnot(identical(dimnames(graph_matrix), dimnames(time_matrix)))
+
+  # 基于 ground truth：仅当 graph==1 时使用 time；否则视为无边(Inf)
+  wt <- matrix(Inf, nrow(graph_matrix), ncol(graph_matrix),
+               dimnames = dimnames(graph_matrix))
+
+  true_edges <- which(graph_matrix == 1, arr.ind = TRUE)
+  if (nrow(true_edges) > 0) {
+    te_time <- time_matrix[true_edges]
+    # 允许 time_matrix 在 graph==0 处有值，但此处不会被用到（被忽略）
+    if (any(is.na(te_time) | !is.finite(te_time) | te_time <= 0)) {
+      stop("For edges with graph_matrix==1, time_matrix must provide positive finite times.")
+    }
+    te_time <- as.integer(round(te_time))  # 强制为整数
+    if (any(te_time <= 0)) {
+      stop("Rounded times for true edges must remain positive integers.")
+    }
+    wt[true_edges] <- te_time
+  }
+  wt
+}
+
+# 2) 预计算所有对最短路
+#    - engine="igraph" 推荐（大图更快）；"dijkstra" 为 O(n^2) 简洁实现
+precompute_shortest_paths <- function(wt, engine = c("igraph", "dijkstra")) {
+  engine <- match.arg(engine)
+  n <- nrow(wt)
+  stopifnot(ncol(wt) == n)
+
+  if (engine == "igraph") {
+    if (!requireNamespace("igraph", quietly = TRUE)) {
+      stop("Please install.packages('igraph') or use engine='dijkstra'.")
+    }
+    g <- igraph::graph_from_adjacency_matrix(
+      wt, mode = "directed", weighted = TRUE
+    )
+    # igraph::distances: 行是源，列是目的
+    dist_mat <- igraph::distances(g, mode = "out", weights = igraph::E(g)$weight)
+    rownames(dist_mat) <- rownames(wt)
+    colnames(dist_mat) <- colnames(wt)
+    return(dist_mat)
+  } else {
+    # 朴素多次 Dijkstra（每个节点当源跑一次）
+    dijkstra_single_source <- function(wt_mat, s) {
+      dist <- rep(Inf, n)
+      visited <- rep(FALSE, n)
+      dist[s] <- 0L
+      for (.iter in seq_len(n)) {
+        u <- which.min(ifelse(visited, Inf, dist))
+        if (!is.finite(dist[u])) break
+        visited[u] <- TRUE
+        nbrs <- which(is.finite(wt_mat[u, ]))
+        if (length(nbrs) > 0) {
+          alt <- dist[u] + wt_mat[u, nbrs]
+          to_update <- alt < dist[nbrs]
+          if (any(to_update)) dist[nbrs[to_update]] <- alt[to_update]
+        }
+      }
+      dist
+    }
+    dist_mat <- sapply(seq_len(n), function(s) dijkstra_single_source(wt, s))
+    dist_mat <- t(dist_mat)  # 行=源，列=目的
+    rownames(dist_mat) <- rownames(wt)
+    colnames(dist_mat) <- colnames(wt)
+    return(dist_mat)
+  }
+}
+
+# 3) 基于预计算 dist_mat 的快速可达判定
+#    多源最短路等价于对源集合行做列向量元素最小值（min over sources）
+compute_edge_reachability_from_dist <- function(
+  intervene_matrix,
+  dist_mat,
+  detected_time = 1L,
+  error_rate = 0
+) {
+  stopifnot(is.matrix(intervene_matrix), is.matrix(dist_mat))
+  stopifnot(identical(colnames(intervene_matrix), rownames(dist_mat)))
+  stopifnot(identical(colnames(intervene_matrix), colnames(dist_mat)))
+
+  num_experiments <- nrow(intervene_matrix)
+  genes <- colnames(intervene_matrix)
+  n <- length(genes)
+
+  result <- matrix(0L, nrow = num_experiments, ncol = n,
+                   dimnames = list(rownames(intervene_matrix), genes))
+
+  # 尽量加速：优先使用 matrixStats::colMins；否则 fallback 到 apply
+  use_ms <- requireNamespace("matrixStats", quietly = TRUE)
+
+  for (i in seq_len(num_experiments)) {
+    sources <- which(intervene_matrix[i, ] == 1L)
+    if (length(sources) == 0) next
+
+    # 选取源对应的行子矩阵
+    subD <- dist_mat[genes[sources], , drop = FALSE]
+
+    # 多源最短路 = 对 subD 的行做列最小
+    if (nrow(subD) == 1L) {
+      minDist <- subD[1L, ]
+    } else if (use_ms) {
+      minDist <- matrixStats::colMins(subD, na.rm = TRUE)
+    } else {
+      minDist <- apply(subD, 2L, min, na.rm = TRUE)
+    }
+
+    reachable <- is.finite(minDist) & (minDist <= detected_time)
+    result[i, reachable] <- 1L
+
+    # 按原规则：干预到的基因置 NA
+    result[i, genes[sources]] <- NA_integer_
+  }
+
+  # 可选：注入翻转噪声（跳过 NA）
+  if (error_rate > 0) {
+    non_na_mask <- !is.na(result)
+    flip_candidates <- which(non_na_mask)
+    num_flips <- ceiling(length(flip_candidates) * error_rate)
+    if (num_flips > 0) {
+      flip_indices <- sample(flip_candidates, num_flips)
+      result[flip_indices] <- 1L - result[flip_indices]
+    }
+  }
+
+  result
+}
+```
+
+
+```{r}
+build_time_matrix_manual <- function(
+  adj_truth,
+  props,                # 数值向量，表示各档的比例（将归一化使和为1）
+  times,                # 整数向量，表示各档对应的传播时间；长度须与 props 相同
+  seed         = NULL,  # 设定则可复现
+  non_edge_fill = 0L,   # 非边填充值：0L 或 NA_integer_
+  shuffle_edges = TRUE  # 是否对真边顺序洗牌后再分配
+) {
+  stopifnot(is.matrix(adj_truth))
+  if (!all(adj_truth %in% c(0, 1))) {
+    stop("adj_truth must be a 0/1 adjacency matrix.")
+  }
+  stopifnot(is.numeric(props), is.numeric(times), length(props) == length(times))
+  if (any(times <= 0) || any(!is.finite(times))) {
+    stop("`times` must be positive finite numbers (integers will be enforced).")
+  }
+  times <- as.integer(round(times))
+
+  if (!is.null(seed)) set.seed(seed)
+
+  # 找到所有真边的 (i,j) 索引
+  edges <- which(adj_truth == 1L, arr.ind = TRUE)
+  m <- nrow(edges)
+
+  tm <- matrix(non_edge_fill,
+               nrow = nrow(adj_truth),
+               ncol = ncol(adj_truth),
+               dimnames = dimnames(adj_truth))
+
+  if (m == 0L) {
+    warning("No edges in adj_truth; return all `non_edge_fill` matrix.")
+    return(tm)
+  }
+
+  # 归一化 props，并用“最大余数法”得到各档计数，保证总和 == m
+  props <- pmax(props, 0)
+  if (sum(props) == 0) stop("All `props` are zero; nothing to assign.")
+  p <- props / sum(props)
+
+  raw_counts <- m * p
+  base_counts <- floor(raw_counts)
+  residue <- raw_counts - base_counts
+  # 剩余需要分配的数量
+  remaining <- m - sum(base_counts)
+  if (remaining > 0) {
+    # 选择 residue 最大的 remaining 个档位，+1
+    idx <- order(residue, decreasing = TRUE)[seq_len(remaining)]
+    base_counts[idx] <- base_counts[idx] + 1L
+  }
+  counts <- base_counts
+  stopifnot(sum(counts) == m)
+
+  # 可选：洗牌以打散原有顺序
+  ord <- if (shuffle_edges) sample.int(m, m) else seq_len(m)
+
+  # 依次取前 counts[k] 条边赋值 times[k]
+  start <- 1L
+  for (k in seq_along(times)) {
+    c_k <- counts[k]
+    if (c_k <= 0L) next
+    idx_k <- ord[start:(start + c_k - 1L)]
+    ij <- edges[idx_k, , drop = FALSE]
+    tm[ij] <- times[k]
+    start <- start + c_k
+  }
+
+  tm
+}
+```
+
+```{r}
+build_time_matrix_dist <- function(
+  adj_truth,
+  dist = c("norm"),
+  params = list(mean = 1, sd = 0.25),
+  non_edge_fill = 0L,
+  round_to_int = TRUE,
+  min_time = 1,
+  max_time = Inf,
+  seed = NULL
+) {
+  # within function only-if-null helper
+  `%||%` <- function(x, y) if (is.null(x)) y else x
+
+  stopifnot(is.matrix(adj_truth))
+  if (!all(adj_truth %in% c(0, 1))) {
+    stop("adj_truth must be a 0/1 adjacency matrix.")
+  }
+  if (!is.null(seed)) set.seed(seed)
+
+  tm <- matrix(non_edge_fill,
+               nrow = nrow(adj_truth),
+               ncol = ncol(adj_truth),
+               dimnames = dimnames(adj_truth))
+
+  edges <- which(adj_truth == 1L, arr.ind = TRUE)
+  m <- nrow(edges)
+  if (m == 0L) {
+    warning("No edges in adj_truth; return all `non_edge_fill` matrix.")
+    return(tm)
+  }
+
+  dist <- match.arg(dist)
+
+  if (dist == "norm") {
+    mean <- params$mean %||% 1
+    sd   <- params$sd   %||% 0.25
+    if (!is.finite(mean) || !is.finite(sd) || sd < 0) {
+      stop("For normal distribution, `mean` must be finite and `sd` >= 0.")
+    }
+    vals <- rnorm(m, mean = mean, sd = sd)
+  } else {
+    stop("Unsupported `dist`. Extend here for other distributions.")
+  }
+
+  vals <- pmin(pmax(vals, min_time), max_time)
+  if (round_to_int) {
+    vals <- as.integer(round(vals))
+    vals[vals < 1L] <- 1L
+  }
+
+  tm[edges] <- vals
+  tm
+}
+```
+
+
+```{r}
+true_graph_test = readRDS("/nfs/turbo/umms-welchjd-code/code/wzqian/Casualformer/theory/secondary_design/example_graph_s093.rds")
+exp_design = readRDS("/nfs/turbo/umms-welchjd-code/code/wzqian/Casualformer/theory/secondary_design/example_exp_design_s093.rds")
+```
+
+
+
+
+# add time delay in the experimenal results
+```{r}
+tm_manual <- build_time_matrix_manual(
+  true_graph_test ,
+  props = c(0.7, 0.3),
+  times = c(1, 2),
+  seed  = 42L,
+  non_edge_fill = 0L
+)
+
+```
+
+```{r}
+tm_manual <- build_time_matrix_manual(
+  true_graph_test ,
+  props = c(0.3, 0.6,0.1),
+  times = c(1, 2,3),
+  seed  = 42L,
+  non_edge_fill = 0L
+)
+
+```
+
+```{r}
+weights       <- build_weight_matrix(graph_matrix = true_graph_test, time_matrix = tm_manual)
+dist_mat_igraph <- precompute_shortest_paths(weights, engine = "igraph")
+dist_mat_dijkstra<- precompute_shortest_paths(weights, engine = "dijkstra")# 或 "dijkstra"
+```
+
+```{r}
+identical(dist_mat_dijkstra, dist_mat_igraph)
+```
+
+```{r}
+exp_results_notime = compute_edge_reachability_matrix(exp_design,true_graph_test)
+exp_results_time_1 = compute_edge_reachability_from_dist(exp_design, dist_mat_igraph, detected_time = 1L, error_rate = 0
+)
+exp_results_time_2 = compute_edge_reachability_from_dist(exp_design, dist_mat_igraph, detected_time = 2L, error_rate = 0
+)
+print(sum(exp_results_notime,na.rm = T))
+print(sum(exp_results_time_1,na.rm = T))
+print(sum(exp_results_time_2 ,na.rm = T))
+```
+
+```{r}
+saveRDS(dist_mat_igraph,"/nfs/turbo/umms-welchjd-code/code/wzqian/Casualformer/theory/DD_simu/multi_time/dist_mat_igraph_example.rds")
+saveRDS(exp_results_time_1,"/nfs/turbo/umms-welchjd-code/code/wzqian/Casualformer/theory/DD_simu/multi_time/exp_results_time_1.rds")
+saveRDS(exp_results_time_2,"/nfs/turbo/umms-welchjd-code/code/wzqian/Casualformer/theory/DD_simu/multi_time/exp_results_time_2.rds")
+
+```
+
+
+```{r}
+adj_DD_time1 = infer_edges_definite(exp_design, exp_results_time_1 )
+```
+
+```{r}
+adj_DD_time2 = infer_edges_definite(exp_design, exp_results_time_2 )
+```
+
+```{r}
+compute_precision_recall_DD(adj_DD_time1,true_graph_test)
+compute_precision_recall_DD(adj_DD_time2,true_graph_test)
+```
+
+```{r}
+saveRDS(adj_DD_time1,"/nfs/turbo/umms-welchjd-code/code/wzqian/Casualformer/theory/DD_simu/multi_time/adj_DD_time1.rds")
+saveRDS(adj_DD_time2,"/nfs/turbo/umms-welchjd-code/code/wzqian/Casualformer/theory/DD_simu/multi_time/adj_DD_time2.rds")
+```
+
+```{r}
+ adj_DD_time1 = readRDS("/nfs/turbo/umms-welchjd-code/code/wzqian/Casualformer/theory/DD_simu/multi_time/adj_DD_time1.rds")
+adj_DD_time2 = readRDS("/nfs/turbo/umms-welchjd-code/code/wzqian/Casualformer/theory/DD_simu/multi_time/adj_DD_time2.rds")
+```
+
+
+```{r}
+as_binary_adj_from_DD <- function(edge_matrix) {
+  stopifnot(is.matrix(edge_matrix))
+  A <- matrix(0L, nrow = nrow(edge_matrix), ncol = ncol(edge_matrix),
+              dimnames = dimnames(edge_matrix))
+  A[edge_matrix == 1L] <- 1L
+  A
+}
+
+# 核心：依据“不可由间接路径解释”的原则，从第2轮挑选新增直达边
+infer_new_direct_edges_between_rounds <- function(
+  adj_DD1,  # 第一轮的 0/1 邻接（直达边）
+  adj_DD2   # 第二轮的 0/1 邻接（含传播后的候选直达边）
+) {
+  if (!requireNamespace("igraph", quietly = TRUE)) {
+    stop("Please install.packages('igraph') for reachability checks.")
+  }
+  stopifnot(is.matrix(adj_DD1), is.matrix(adj_DD2))
+  stopifnot(identical(dimnames(adj_DD1), dimnames(adj_DD2)))
+
+  # 仅在第二轮出现而第一轮没有的候选边
+  cand <- (adj_DD2 == 1L) & (adj_DD1 != 1L)
+  if (!any(cand)) {
+    # 没有候选，直接输出
+    confidence <- adj_DD1 + adj_DD2
+    return(list(
+      adj_combined = (adj_DD1 | adj_DD2) * 1L,
+      new_edges_from_round2 = matrix(0L, nrow = nrow(adj_DD1), ncol = ncol(adj_DD1),
+                                     dimnames = dimnames(adj_DD1)),
+      confidence = confidence
+    ))
+  }
+
+  # 联合图 U = E1 ∪ E2
+  U <- (adj_DD1 | adj_DD2) * 1L
+  genes <- rownames(U)
+
+  # 构图（带权与否都可；这里仅用可达性，设为非加权有向图）
+  g_from_adj <- function(A) {
+    igraph::graph_from_adjacency_matrix(A, mode = "directed", diag = FALSE)
+  }
+
+  # 对每条候选边 (u,v)，在 U 去掉该边后，看是否仍有 u->v 路径
+  new_from_r2 <- matrix(0L, nrow = nrow(U), ncol = ncol(U), dimnames = dimnames(U))
+
+  # 将候选列表列成边集
+  ij <- which(cand, arr.ind = TRUE)
+  for (k in seq_len(nrow(ij))) {
+    i <- ij[k, 1]; j <- ij[k, 2]
+
+    # 临时移除边 (i,j)
+    U_minus <- U
+    U_minus[i, j] <- 0L
+
+    g <- g_from_adj(U_minus)
+
+    # 判断 u->v 是否可达（有路径即可）
+    # igraph::distances 返回有限值表示可达
+    d <- igraph::distances(g, v = i, to = j, mode = "out")
+    reachable_without_e <- is.finite(d)
+    if (!reachable_without_e) {
+      # 无任何间接路径可解释 => 作为新增直达边
+      new_from_r2[i, j] <- 1L
+    }
+  }
+
+  # 合并：第一轮直达 ∪ 第二轮新增直达
+  adj_combined <- (adj_DD1 | new_from_r2) * 1L
+
+  # 置信度：两轮出现次数之和（0/1/2）
+  confidence <- adj_DD1 + adj_DD2
+
+  list(
+    adj_combined = adj_combined,
+    new_edges_from_round2 = new_from_r2,
+    confidence = confidence
+  )
+}
+```
+
+
+```{r}
+adj_DD1 <- as_binary_adj_from_DD( adj_DD_time1)
+adj_DD2 <- as_binary_adj_from_DD( adj_DD_time2)
+
+```
+
+```{r}
+out <- infer_new_direct_edges_between_rounds(adj_DD1, adj_DD2)
+```
+
+```{r}
+compute_precision_recall_DD(out$adj_combined,true_graph_test)
+```
+

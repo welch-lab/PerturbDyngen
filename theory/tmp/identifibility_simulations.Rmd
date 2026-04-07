@@ -1,0 +1,1923 @@
+---
+title: "identify_prob_simulations"
+output: html_document
+date: "2025-05-13"
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+library(tidyverse)
+library(ggplot2)
+library(dplyr)
+library(patchwork)
+#library(lpSolve)
+library(progress)
+library(ROI)
+library(ROI.plugin.highs)
+library(glmnet)
+source("/nfs/turbo/umms-welchjd-code/code/wzqian/Casualformer/theory/theory_simulations_func.R")
+```
+
+# construct experiments satisfying ordered paired condition
+
+```{r}
+my_exp <- fair_ordered(250,65,8)
+saveRDS(my_exp, file = "/nfs/turbo/umms-welchjd/wzqian/Casualformer/theory/exp250_N65.rds")
+```
+
+
+
+
+```{r}
+my_exp = readRDS("/nfs/turbo/umms-welchjd/wzqian/Casualformer/theory/exp250_N65.rds")
+```
+
+
+```{r}
+# the sparsity here is actually the % of edges
+true_graph_test = sample_directed_graph(250,0,sparsity = 0.2)
+print(sum(true_graph_test)/(dim(true_graph_test)[1] * dim(true_graph_test)[2]))
+```
+
+```{r}
+exp_design = my_exp$experiment_matrix
+colnames(exp_design) = rownames(true_graph_test)
+```
+
+```{r}
+exp_results = compute_edge_reachability_matrix(exp_design,true_graph_test)
+```
+
+
+```{r}
+lp_data <- prepare_edge_lp_matrices(exp_design, exp_results)
+```
+
+```{r}
+saveRDS(lp_data,"/nfs/turbo/umms-welchjd/wzqian/Casualformer/theory/lp_data_N250_exp65_sp0.2.rds")
+```
+
+
+### on turbo
+```{r}
+lp_data <-readRDS("/nfs/turbo/umms-welchjd/wzqian/Casualformer/theory/lp_data_N250_exp65_sp0.2.rds")
+```
+
+```{r}
+lp_data$f.dir <- gsub("^=$", "==", lp_data$f.dir)
+```
+
+
+```{r}
+model <- build_highs_model(lp_data)
+
+result <- ROI_solve(model, solver = "highs")
+```
+
+```{r}
+saveRDS(result, "/nfs/turbo/umms-welchjd/wzqian/Casualformer/theory/lp_sol_highs_N250_exp65_sp0.2.rds")
+```
+
+```{r}
+solution <- solution(result)
+adj_matrix <- matrix(solution,
+                     nrow = length(colnames(exp_design)),
+                     ncol = length(colnames(exp_results)),
+                     dimnames = list(colnames(exp_design), colnames(exp_results)))
+```
+
+
+
+
+
+```{r}
+precision_recall1 <- calculate_precision_recall_hard(true_graph_test, adj_matrix)
+precision_recall2 <- calculate_precision_recall_zero(true_graph_test, adj_matrix)
+precision_recall3 <- calculate_precision_recall_soft(true_graph_test, adj_matrix)
+```
+
+```{r}
+saveRDS(list("precision_recall_hard" = precision_recall1,"precision_recall_zero"= precision_recall2,"precision_recall_hard"=precision_recall3 ),"/nfs/turbo/umms-welchjd/wzqian/Casualformer/theory/precision_recall_highs_N250_exp65_sp0.2.rds")
+```
+
+
+# sanity check
+
+```{r}
+my_exp <- fair_ordered(14,10,3)
+saveRDS(my_exp, file = "/nfs/turbo/umms-welchjd/wzqian/Casualformer/theory/exp8_N14.rds")
+```
+
+
+```{r}
+true_graph_test = sample_directed_graph(14,0,sparsity = 0.2)
+print(sum(true_graph_test)/(dim(true_graph_test)[1] * dim(true_graph_test)[2]))
+```
+
+```{r}
+exp_design = my_exp$experiment_matrix
+colnames(exp_design) = rownames(true_graph_test)
+```
+
+```{r}
+exp_results = compute_edge_reachability_matrix(exp_design,true_graph_test)
+```
+
+
+```{r}
+lp_data <- prepare_edge_lp_matrices(exp_design, exp_results)
+model <- build_highs_model(lp_data)
+
+result <- ROI_solve(model, solver = "highs")
+```
+
+```{r}
+solution <- solution(result)
+adj_matrix <- matrix(solution,
+                     nrow = length(colnames(exp_design)),
+                     ncol = length(colnames(exp_results)),
+                     dimnames = list(colnames(exp_design), colnames(exp_results)))
+```
+
+
+
+```{r}
+precision_recall1 <- calculate_precision_recall_hard(true_graph_test, adj_matrix)
+precision_recall2 <- calculate_precision_recall_zero(true_graph_test, adj_matrix)
+precision_recall3 <- calculate_precision_recall_soft(true_graph_test, adj_matrix)
+```
+
+
+
+```{r}
+saveRDS(list("metrics"=precision_recall1, "my_exp" = my_exp, "exp_result" = exp_results ,"true_adj" = true_graph_test,"infer_adj"= adj_matrix,"sparsity" = 0.1887),"/nfs/turbo/umms-welchjd/wzqian/Casualformer/theory/sanity_check_save.rds")
+```
+
+```{r}
+library(ggplot2)
+library(reshape2)
+
+# Example: your matrices should be binary (0/1 or similar)
+# adj_matrix: inferred
+# true_graph_test: ground truth
+
+# Identify FP and FN
+fp_matrix <- (adj_matrix == 1) & (true_graph_test == 0)
+fn_matrix <- (adj_matrix == 0) & (true_graph_test == 1)
+
+# Create a label matrix: 0 = correct, 1 = FP, 2 = FN
+label_matrix <- matrix(0, nrow = nrow(adj_matrix), ncol = ncol(adj_matrix))
+label_matrix[fp_matrix] <- 1
+label_matrix[fn_matrix] <- 2
+
+# Melt for ggplot
+melted <- melt(label_matrix)
+colnames(melted) <- c("From", "To", "Type")
+
+# Plot
+ggplot(melted, aes(x = To, y = From, fill = factor(Type))) +
+  geom_tile(color = "grey") +
+  scale_fill_manual(values = c("0" = "white", "1" = "red", "2" = "blue"),
+                    labels = c("Correct", "False Positive", "False Negative"),
+                    name = "Edge Type") +
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle = 90)) +
+  coord_fixed()
+```
+
+# test how accuracy and recall changing over # of experiments
+
+
+```{r}
+true_graph_test <- sample_directed_graph(250, 0, sparsity = 0.2)
+
+experiment_counts <- seq(65, 165, by = 20)
+results_exp1 <- list()
+
+for (num_exp in experiment_counts) {
+  my_exp <- fair_ordered(250, num_exp, 8)
+  exp_design <- my_exp$experiment_matrix
+  colnames(exp_design) <- rownames(true_graph_test)
+
+  exp_results <- compute_edge_reachability_matrix(exp_design, true_graph_test)
+  lp_data <- prepare_edge_lp_matrices(exp_design, exp_results)
+
+  model <- build_highs_model(lp_data)
+  result <- ROI_solve(model, solver = "highs")
+  solution_mat <- matrix(solution(result), 
+                         nrow = ncol(exp_design), 
+                         ncol = ncol(exp_results),
+                         dimnames = list(colnames(exp_design), colnames(exp_results)))
+
+  res_hard <- calculate_precision_recall_hard(true_graph_test, solution_mat)
+  res_zero <- calculate_precision_recall_zero(true_graph_test, solution_mat)
+  res_soft <- calculate_precision_recall_soft(true_graph_test, solution_mat)
+
+  results_exp1[[as.character(num_exp)]] <- data.frame(
+    experiments = num_exp,
+    method = rep(c("hard", "zero", "soft"), each = 2),
+    metric = rep(c("precision", "recall"), 3),
+    value = c(res_hard$precision, res_hard$recall,
+              res_zero$precision, res_zero$recall,
+              res_soft$precision, res_soft$recall)
+  )
+}
+
+df_exp1 <- bind_rows(results_exp1)
+write.csv(df_exp1, "/nfs/turbo/umms-welchjd/wzqian/Casualformer/theory/results/highs_results_test/precision_recall_vs_experiments_N250_sp0.2.csv", row.names = FALSE)
+png("/nfs/turbo/umms-welchjd/wzqian/Casualformer/theory/results/highs_results_test/precision_recall_vs_experiments_N250_sp0.2.png",width = 12, height = 8, units = "in", res = 300)
+ggplot(df_exp1, aes(x = experiments, y = value, color = method, linetype = metric)) +
+  geom_line(size = 1) +
+  geom_point() +
+  labs(title = "Precision & Recall vs. #Experiments (Fixed Graph)",
+       y = "Score") +
+  theme_minimal()
+dev.off()
+```
+
+```{r}
+sparsities <- c(0.2, 0.15, 0.10, 0.05, 0.01)
+num_exp <- 65
+ my_exp <- fair_ordered(250, num_exp, 8)
+results_exp2_sparsity_based <- list()
+results_exp2_zero_based <- list()
+
+for (s in sparsities) {
+  tmp_list <- replicate(5, {
+    true_graph_test <- sample_directed_graph(250, 0, sparsity = s)
+    exp_design <- my_exp$experiment_matrix
+    colnames(exp_design) <- rownames(true_graph_test)
+    exp_results <- compute_edge_reachability_matrix(exp_design, true_graph_test)
+    num_zeros <- sum(exp_results == 0)
+
+    lp_data <- prepare_edge_lp_matrices(exp_design, exp_results)
+    lp_data$f.dir <- gsub("^=$", "==", lp_data$f.dir)
+
+    model <- build_highs_model(lp_data)
+    result <- ROI_solve(model, solver = "highs")
+    solution_mat <- matrix(solution(result), 
+                           nrow = ncol(exp_design), 
+                           ncol = ncol(exp_results),
+                           dimnames = list(colnames(exp_design), colnames(exp_results)))
+
+    list(
+      hard = calculate_precision_recall_hard(true_graph_test, solution_mat),
+      zero = calculate_precision_recall_zero(true_graph_test, solution_mat),
+      soft = calculate_precision_recall_soft(true_graph_test, solution_mat),
+      num_zeros = num_zeros
+    )
+  }, simplify = FALSE)
+
+
+  average_metrics <- function(type, metric) {
+    mean(sapply(tmp_list, function(x) x[[type]][[metric]]))
+  }
+
+  avg_zero_count <- mean(sapply(tmp_list, function(x) x$num_zeros))
+
+
+  results_exp2_sparsity_based[[as.character(s)]] <- data.frame(
+    sparsity = s,
+    method = rep(c("hard", "zero", "soft"), each = 2),
+    metric = rep(c("precision", "recall"), 3),
+    value = c(
+      average_metrics("hard", "precision"), average_metrics("hard", "recall"),
+      average_metrics("zero", "precision"), average_metrics("zero", "recall"),
+      average_metrics("soft", "precision"), average_metrics("soft", "recall")
+    )
+  )
+
+
+  results_exp2_zero_based[[as.character(s)]] <- data.frame(
+    zero_count = avg_zero_count,
+    method = rep(c("hard", "zero", "soft"), each = 2),
+    metric = rep(c("precision", "recall"), 3),
+    value = c(
+      average_metrics("hard", "precision"), average_metrics("hard", "recall"),
+      average_metrics("zero", "precision"), average_metrics("zero", "recall"),
+      average_metrics("soft", "precision"), average_metrics("soft", "recall")
+    )
+  )
+  gc()
+}
+
+
+df_exp2_sparsity <- bind_rows(results_exp2_sparsity_based)
+df_exp2_zero <- bind_rows(results_exp2_zero_based)
+
+write.csv(df_exp2_sparsity, "/nfs/turbo/umms-welchjd/wzqian/Casualformer/theory/results/highs_results_test/precision_recall_vs_sparsity_N250.csv", row.names = FALSE)
+write.csv(df_exp2_zero, "/nfs/turbo/umms-welchjd/wzqian/Casualformer/theory/results/highs_results_test/precision_recall_vs_negative_number_N250.csv", row.names = FALSE)
+
+
+png("/nfs/turbo/umms-welchjd/wzqian/Casualformer/theory/results/highs_results_test/precision_recall_vs_sparsity_N250.png",width = 12, height = 8, units = "in", res = 300)
+ggplot(df_exp2_sparsity, aes(x = sparsity, y = value, color = method, linetype = metric)) +
+  geom_line(size = 1) +
+  geom_point() +
+  labs(title = "Precision & Recall vs. Sparsity (Fixed #Experiments)",
+       y = "Metrics") +
+  theme_minimal()
+dev.off()
+
+png("/nfs/turbo/umms-welchjd/wzqian/Casualformer/theory/results/highs_results_test/precision_recall_vs_negative_number_N250.png",width = 2000,height = 1600)
+ggplot(df_exp2_zero, aes(x = zero_count, y = value, color = method, linetype = metric)) +
+  geom_line(size = 1) +
+  geom_point() +
+  labs(title = "Precision & Recall vs. # of negative test outcomes",
+       x = "#Zeros in exp_results", y = "Score") +
+  theme_minimal()
+dev.off()
+
+
+
+
+```
+
+
+```{r}
+true_graph_test = sample_graph_exponential_degree(250,0,rate = 0.01)
+1 - calculate_sparsity(true_graph_test)
+true_graph_test = sample_graph_exponential_degree(250,0,rate = 0.02)
+1 - calculate_sparsity(true_graph_test)
+true_graph_test = sample_graph_exponential_degree(250,0,rate = 0.05)
+1 - calculate_sparsity(true_graph_test)
+true_graph_test = sample_graph_exponential_degree(250,0,rate =0.1)
+1 - calculate_sparsity(true_graph_test)
+true_graph_test = sample_graph_exponential_degree(250,0,rate = 0.5)
+1 - calculate_sparsity(true_graph_test)
+```
+
+```{r}
+true_graph_test = sample_graph_powerlaw_degree(250,0,gamma = 1.3)
+1 - calculate_sparsity(true_graph_test)
+true_graph_test = sample_graph_powerlaw_degree(250,0,gamma = 1.4)
+1 - calculate_sparsity(true_graph_test)
+true_graph_test = sample_graph_powerlaw_degree(250,0,gamma = 1.5)
+1 - calculate_sparsity(true_graph_test)
+true_graph_test = sample_graph_powerlaw_degree(250,0,gamma =1.6)
+1 - calculate_sparsity(true_graph_test)
+true_graph_test = sample_graph_powerlaw_degree(250,0,gamma = 2)
+1 - calculate_sparsity(true_graph_test)
+```
+
+
+
+```{r}
+seed = 123
+rates <- c(0.01, 0.02, 0.05, 0.1, 0.5)
+num_exp <- 65
+my_exp <- fair_ordered(250, num_exp, 8)
+results_exp2_exp_based <- list()
+
+for (rate in rates) {
+    tmp_list <- lapply(0:4, function(i) {
+    set.seed(123 + i)  # Set seed for reproducibility
+    
+    true_graph_test <- sample_graph_exponential_degree(250, 0, rate = rate)
+    sparsity <- calculate_sparsity(true_graph_test)
+    
+    exp_design <- my_exp$experiment_matrix
+    colnames(exp_design) <- rownames(true_graph_test)
+    exp_results <- compute_edge_reachability_matrix(exp_design, true_graph_test)
+    num_zeros <- sum(exp_results == 0)
+
+    lp_data <- prepare_edge_lp_matrices(exp_design, exp_results)
+    lp_data$f.dir <- gsub("^=$", "==", lp_data$f.dir)
+
+    model <- build_highs_model(lp_data)
+    result <- ROI_solve(model, solver = "highs")
+    solution_mat <- matrix(solution(result), 
+                           nrow = ncol(exp_design), 
+                           ncol = ncol(exp_results),
+                           dimnames = list(colnames(exp_design), colnames(exp_results)))
+
+    list(
+      hard = calculate_precision_recall_hard(true_graph_test, solution_mat),
+      zero = calculate_precision_recall_zero(true_graph_test, solution_mat),
+      soft = calculate_precision_recall_soft(true_graph_test, solution_mat),
+      num_zeros = num_zeros,
+      sparsity = sparsity
+    )
+  })
+  average_metrics <- function(type, metric) {
+    mean(sapply(tmp_list, function(x) x[[type]][[metric]]))
+  }
+  avg_zero_count <- mean(sapply(tmp_list, function(x) x$num_zeros))
+  avg_sparsity <- mean(sapply(tmp_list, function(x) x$sparsity))
+
+  results_exp2_exp_based[[as.character(rate)]] <- data.frame(
+    rate = rate,
+    method = rep(c("hard", "zero", "soft"), each = 2),
+    metric = rep(c("precision", "recall"), 3),
+    value = c(
+      average_metrics("hard", "precision"), average_metrics("hard", "recall"),
+      average_metrics("zero", "precision"), average_metrics("zero", "recall"),
+      average_metrics("soft", "precision"), average_metrics("soft", "recall")
+    ),
+    zero_count = avg_zero_count,
+    avg_sparsity = avg_sparsity
+  )
+  gc()
+}
+
+df_exp2_exp <- bind_rows(results_exp2_exp_based)
+write.csv(df_exp2_exp, "/nfs/turbo/umms-welchjd/wzqian/Casualformer/theory/results/highs_results_test/precision_recall_vs_exponential_rate.csv", row.names = FALSE)
+```
+
+```{r}
+gammas <- c(1.3, 1.4, 1.5, 1.6, 2.0)
+results_exp2_powerlaw_based <- list()
+
+for (gamma in gammas) {
+  tmp_list <- lapply(0:4, function(i) {
+    set.seed(123 + i)
+    
+    true_graph_test <- sample_graph_powerlaw_degree(250, 0, gamma = gamma)
+    sparsity <- calculate_sparsity(true_graph_test)
+    
+    exp_design <- my_exp$experiment_matrix
+    colnames(exp_design) <- rownames(true_graph_test)
+    exp_results <- compute_edge_reachability_matrix(exp_design, true_graph_test)
+    num_zeros <- sum(exp_results == 0)
+
+    lp_data <- prepare_edge_lp_matrices(exp_design, exp_results)
+    lp_data$f.dir <- gsub("^=$", "==", lp_data$f.dir)
+
+    model <- build_highs_model(lp_data)
+    result <- ROI_solve(model, solver = "highs")
+    solution_mat <- matrix(solution(result), 
+                           nrow = ncol(exp_design), 
+                           ncol = ncol(exp_results),
+                           dimnames = list(colnames(exp_design), colnames(exp_results)))
+
+    list(
+      hard = calculate_precision_recall_hard(true_graph_test, solution_mat),
+      zero = calculate_precision_recall_zero(true_graph_test, solution_mat),
+      soft = calculate_precision_recall_soft(true_graph_test, solution_mat),
+      num_zeros = num_zeros,
+      sparsity = sparsity
+    )
+  })
+
+  average_metrics <- function(type, metric) {
+    mean(sapply(tmp_list, function(x) x[[type]][[metric]]))
+  }
+  avg_zero_count <- mean(sapply(tmp_list, function(x) x$num_zeros))
+  avg_sparsity <- mean(sapply(tmp_list, function(x) x$sparsity))
+
+  results_exp2_powerlaw_based[[as.character(gamma)]] <- data.frame(
+    gamma = gamma,
+    method = rep(c("hard", "zero", "soft"), each = 2),
+    metric = rep(c("precision", "recall"), 3),
+    value = c(
+      average_metrics("hard", "precision"), average_metrics("hard", "recall"),
+      average_metrics("zero", "precision"), average_metrics("zero", "recall"),
+      average_metrics("soft", "precision"), average_metrics("soft", "recall")
+    ),
+    zero_count = avg_zero_count,
+    avg_sparsity = avg_sparsity
+  )
+  gc()
+}
+
+df_exp2_powerlaw <- bind_rows(results_exp2_powerlaw_based)
+write.csv(df_exp2_powerlaw, "/nfs/turbo/umms-welchjd/wzqian/Casualformer/theory/results/highs_results_test/precision_recall_vs_powerlaw_gamma.csv", row.names = FALSE)
+```
+
+
+```{r}
+true_graph_test = sample_graph_exponential_degree(250,0,rate = 0.02, seed = 123)
+
+experiment_counts <- seq(65, 165, by = 20)
+results_exp1 <- list()
+
+for (num_exp in experiment_counts) {
+  my_exp <- fair_ordered(250, num_exp, 8)
+  exp_design <- my_exp$experiment_matrix
+  colnames(exp_design) <- rownames(true_graph_test)
+
+  exp_results <- compute_edge_reachability_matrix(exp_design, true_graph_test)
+  lp_data <- prepare_edge_lp_matrices(exp_design, exp_results)
+
+  model <- build_highs_model(lp_data)
+  result <- ROI_solve(model, solver = "highs")
+  solution_mat <- matrix(solution(result), 
+                         nrow = ncol(exp_design), 
+                         ncol = ncol(exp_results),
+                         dimnames = list(colnames(exp_design), colnames(exp_results)))
+
+  res_hard <- calculate_precision_recall_hard(true_graph_test, solution_mat)
+  res_zero <- calculate_precision_recall_zero(true_graph_test, solution_mat)
+  res_soft <- calculate_precision_recall_soft(true_graph_test, solution_mat)
+
+  results_exp1[[as.character(num_exp)]] <- data.frame(
+    experiments = num_exp,
+    method = rep(c("hard", "zero", "soft"), each = 2),
+    metric = rep(c("precision", "recall"), 3),
+    value = c(res_hard$precision, res_hard$recall,
+              res_zero$precision, res_zero$recall,
+              res_soft$precision, res_soft$recall)
+  )
+}
+
+df_exp1 <- bind_rows(results_exp1)
+write.csv(df_exp1, "/nfs/turbo/umms-welchjd/wzqian/Casualformer/theory/results/highs_results_test/precision_recall_vs_experiments_N250_exponential_sp0.2approx.csv", row.names = FALSE)
+png("/nfs/turbo/umms-welchjd/wzqian/Casualformer/theory/results/highs_results_test/precision_recall_vs_experiments_N250_exponential_sp0.2approx.png",width = 12, height = 8, units = "in", res = 300)
+ggplot(df_exp1, aes(x = experiments, y = value, color = method, linetype = metric)) +
+  geom_line(size = 1) +
+  geom_point() +
+  labs(title = "Precision & Recall vs. #Experiments (exponential, fixed graph)",
+       y = "Score") +
+  theme_minimal()
+dev.off()
+```
+
+
+
+```{r}
+true_graph_test = sample_graph_powerlaw_degree(250,0,gamma = 1.4, seed = 123)
+
+experiment_counts <- seq(65, 165, by = 20)
+results_exp1 <- list()
+
+for (num_exp in experiment_counts) {
+  my_exp <- fair_ordered(250, num_exp, 8)
+  exp_design <- my_exp$experiment_matrix
+  colnames(exp_design) <- rownames(true_graph_test)
+
+  exp_results <- compute_edge_reachability_matrix(exp_design, true_graph_test)
+  lp_data <- prepare_edge_lp_matrices(exp_design, exp_results)
+
+  model <- build_highs_model(lp_data)
+  result <- ROI_solve(model, solver = "highs")
+  solution_mat <- matrix(solution(result), 
+                         nrow = ncol(exp_design), 
+                         ncol = ncol(exp_results),
+                         dimnames = list(colnames(exp_design), colnames(exp_results)))
+
+  res_hard <- calculate_precision_recall_hard(true_graph_test, solution_mat)
+  res_zero <- calculate_precision_recall_zero(true_graph_test, solution_mat)
+  res_soft <- calculate_precision_recall_soft(true_graph_test, solution_mat)
+
+  results_exp1[[as.character(num_exp)]] <- data.frame(
+    experiments = num_exp,
+    method = rep(c("hard", "zero", "soft"), each = 2),
+    metric = rep(c("precision", "recall"), 3),
+    value = c(res_hard$precision, res_hard$recall,
+              res_zero$precision, res_zero$recall,
+              res_soft$precision, res_soft$recall)
+  )
+}
+
+df_exp1 <- bind_rows(results_exp1)
+write.csv(df_exp1, "/nfs/turbo/umms-welchjd/wzqian/Casualformer/theory/results/highs_results_test/precision_recall_vs_experiments_N250_powerlaw_sp0.2approx.csv", row.names = FALSE)
+png("/nfs/turbo/umms-welchjd/wzqian/Casualformer/theory/results/highs_results_test/precision_recall_vs_experiments_N250_powerlaw_sp0.2approx.png",width = 12, height = 8, units = "in", res = 300)
+ggplot(df_exp1, aes(x = experiments, y = value, color = method, linetype = metric)) +
+  geom_line(size = 1) +
+  geom_point() +
+  labs(title = "Precision & Recall vs. #Experiments (powerlow, fixed graph)",
+       y = "Score") +
+  theme_minimal()
+dev.off()
+```
+###########remake figures with experiments lower bounnd
+
+
+```{r}
+true_graph_test = sample_graph_powerlaw_degree(250,0,gamma = 1.4, seed = 123)
+T_bound = calculate_T_bound(sum(true_graph_test==1), 250, 0,250, 8 ) 
+
+df_exp1 = read.csv("/nfs/turbo/umms-welchjd/wzqian/Casualformer/theory/results/highs_results_test/precision_recall_vs_experiments_N250_powerlaw_sp0.2approx.csv")
+png("/nfs/turbo/umms-welchjd/wzqian/Casualformer/theory/results/highs_results_test/precision_recall_vs_experiments_N250_powerlaw_sp0.2approx.png",width = 12, height = 8, units = "in", res = 300)
+ggplot(df_exp1, aes(x = experiments, y = value, color = method, linetype = metric)) +
+  geom_line(size = 1) +
+  geom_point() +
+  labs(title = "Precision & Recall vs. #Experiments (powerlow, fixed graph)", y = "Metrics") +
+  geom_vline(xintercept = T_bound, size = 2 ) + annotate("text", x = T_bound, y = max(df_exp1$value) * 0.2, 
+           label = paste("Lower Bound =", T_bound, ", Sparsity =", calculate_sparsity(true_graph_test)), 
+           vjust = -0.5, angle = 90, hjust = -0.1) +
+  theme_minimal()
+dev.off()
+```
+```{r}
+true_graph_test = sample_graph_exponential_degree(250,0,rate = 0.02, seed = 123)
+T_bound = calculate_T_bound(sum(true_graph_test==1), 250, 0,250, 8 ) 
+df_exp1 = read.csv( "/nfs/turbo/umms-welchjd/wzqian/Casualformer/theory/results/highs_results_test/precision_recall_vs_experiments_N250_exponential_sp0.2approx.csv")
+png("/nfs/turbo/umms-welchjd/wzqian/Casualformer/theory/results/highs_results_test/precision_recall_vs_experiments_N250_exponential_sp0.2approx.png",width = 12, height = 8, units = "in", res = 300)
+ggplot(df_exp1, aes(x = experiments, y = value, color = method, linetype = metric)) +
+  geom_line(size = 1) +
+  geom_point() +
+  labs(title = "Precision & Recall vs. #Experiments (exponential, fixed graph)", y = "Metrics") +
+  geom_vline(xintercept = T_bound, size = 2 ) + annotate("text", x = T_bound, y = max(df_exp1$value) * 0.2, 
+           label = paste("Lower Bound =", T_bound, ", Sparsity =", calculate_sparsity(true_graph_test)), 
+           vjust = -0.5, angle = 90, hjust = -0.1) +
+  theme_minimal()
+dev.off()
+```
+```{r}
+true_graph_test <- sample_directed_graph(250, 0, sparsity = 0.2)
+T_bound = calculate_T_bound(sum(true_graph_test==1), 250, 0,250, 8 ) 
+df_exp1 <- read.csv("/nfs/turbo/umms-welchjd/wzqian/Casualformer/theory/results/highs_results_test/precision_recall_vs_experiments_N250_sp0.2.csv")
+png("/nfs/turbo/umms-welchjd/wzqian/Casualformer/theory/results/highs_results_test/precision_recall_vs_experiments_N250_sp0.2.png",width = 12, height = 8, units = "in", res = 300)
+ggplot(df_exp1, aes(x = experiments, y = value, color = method, linetype = metric)) +
+  geom_line(size = 1) +
+  geom_point() +
+  labs(title = "Precision & Recall vs. #Experiments (uniform, fixed graph)", y = "Metrics") +
+  geom_vline(xintercept = T_bound, size = 2 ) + annotate("text", x = T_bound, y = max(df_exp1$value) * 0.2, 
+           label = paste("Lower Bound =", T_bound, ", Sparsity =", calculate_sparsity(true_graph_test)),  
+           vjust = -0.5, angle = 90, hjust = -0.1) +
+  theme_minimal()
+dev.off()
+```
+
+# make new figures for edges with prior
+```{r}
+png("/nfs/turbo/umms-welchjd/wzqian/Casualformer/theory/results/highs_results_test/precision_recall_vs_exponential_rate_N250.png",width = 12, height = 8, units = "in", res = 300)
+ggplot(df_exp2_exp, aes(x = 1/rate, y = value, color = method, linetype = metric)) +
+  geom_line(size = 1) +
+  geom_point() +
+  labs(title = "Precision & Recall vs. 1/lambda (Fixed #Experiments, exponential)",
+       y = "Metrics", x = "mean # edges for each TF") +
+  theme_minimal()
+dev.off()
+
+png("/nfs/turbo/umms-welchjd/wzqian/Casualformer/theory/results/highs_results_test/precision_recall_vs_exponential_sparsity_N250.png",width = 12, height = 8, units = "in", res = 300)
+ggplot(df_exp2_exp, aes(x = avg_sparsity, y = value, color = method, linetype = metric)) +
+  geom_line(size = 1) +
+  geom_point() +
+  labs(title = "Precision & Recall vs. sparsity (Fixed #Experiments, exponential)",
+       y = "Metrics", x = "sparsity") +
+  theme_minimal()
+dev.off()
+```
+
+
+```{r}
+png("/nfs/turbo/umms-welchjd/wzqian/Casualformer/theory/results/highs_results_test/precision_recall_vs_powerlaw_gamma_N250.png",width = 12, height = 8, units = "in", res = 300)
+ggplot(df_exp2_powerlaw, aes(x = gamma, y = value, color = method, linetype = metric)) +
+  geom_line(size = 1) +
+  geom_point() +
+  labs(title = "Precision & Recall vs. gamma (Fixed #Experiments, powerlaw)",
+       y = "Metrics", x = "gamma") +
+  theme_minimal()
+dev.off()
+
+png("/nfs/turbo/umms-welchjd/wzqian/Casualformer/theory/results/highs_results_test/precision_recall_vs_powerlaw_sparsity_N250.png",width = 12, height = 8, units = "in", res = 300)
+ggplot(df_exp2_powerlaw, aes(x = avg_sparsity, y = value, color = method, linetype = metric)) +
+  geom_line(size = 1) +
+  geom_point() +
+  labs(title = "Precision & Recall vs. sparsity (Fixed #Experiments, powerlaw)",
+       y = "Metrics", x = "sparsity") +
+  theme_minimal()
+dev.off()
+```
+
+
+# test baseline
+```{r}
+sparsities <- c(0.2, 0.15, 0.10, 0.05, 0.01)
+num_exp <- 100
+my_exp <- fair_ordered(100, num_exp, 1)
+results_exp2_sparsity_based <- list()
+results_exp2_zero_based <- list()
+
+for (s in sparsities) {
+  tmp_list <- replicate(5, {
+    true_graph_test <- sample_directed_graph(100, 0, sparsity = s)
+    exp_design <- my_exp$experiment_matrix
+    colnames(exp_design) <- rownames(true_graph_test)
+    exp_results <- compute_edge_reachability_matrix(exp_design, true_graph_test)
+    num_zeros <- sum(exp_results == 0)
+
+    lp_data <- prepare_edge_lp_matrices(exp_design, exp_results)
+    lp_data$f.dir <- gsub("^=$", "==", lp_data$f.dir)
+
+    model <- build_highs_model(lp_data)
+    result <- ROI_solve(model, solver = "highs")
+    solution_mat <- matrix(solution(result), 
+                           nrow = ncol(exp_design), 
+                           ncol = ncol(exp_results),
+                           dimnames = list(colnames(exp_design), colnames(exp_results)))
+
+    list(
+      hard = calculate_precision_recall_hard(true_graph_test, solution_mat),
+      zero = calculate_precision_recall_zero(true_graph_test, solution_mat),
+      soft = calculate_precision_recall_soft(true_graph_test, solution_mat),
+      num_zeros = num_zeros
+    )
+  }, simplify = FALSE)
+
+
+  average_metrics <- function(type, metric) {
+    mean(sapply(tmp_list, function(x) x[[type]][[metric]]))
+  }
+
+  avg_zero_count <- mean(sapply(tmp_list, function(x) x$num_zeros))
+
+
+  results_exp2_sparsity_based[[as.character(s)]] <- data.frame(
+    sparsity = s,
+    method = rep(c("hard", "zero", "soft"), each = 2),
+    metric = rep(c("precision", "recall"), 3),
+    value = c(
+      average_metrics("hard", "precision"), average_metrics("hard", "recall"),
+      average_metrics("zero", "precision"), average_metrics("zero", "recall"),
+      average_metrics("soft", "precision"), average_metrics("soft", "recall")
+    )
+  )
+
+
+  results_exp2_zero_based[[as.character(s)]] <- data.frame(
+    zero_count = avg_zero_count,
+    method = rep(c("hard", "zero", "soft"), each = 2),
+    metric = rep(c("precision", "recall"), 3),
+    value = c(
+      average_metrics("hard", "precision"), average_metrics("hard", "recall"),
+      average_metrics("zero", "precision"), average_metrics("zero", "recall"),
+      average_metrics("soft", "precision"), average_metrics("soft", "recall")
+    )
+  )
+  gc()
+}
+
+
+df_exp2_sparsity <- bind_rows(results_exp2_sparsity_based)
+
+
+write.csv(df_exp2_sparsity, "/nfs/turbo/umms-welchjd/wzqian/Casualformer/theory/results/highs_results_test/precision_recall_vs_sparsity_N100_baseline.csv", row.names = FALSE)
+
+png("/nfs/turbo/umms-welchjd/wzqian/Casualformer/theory/results/highs_results_test/precision_recall_vs_sparsity_N100_baseline.png",width = 12, height = 8, units = "in", res = 300)
+ggplot(df_exp2_sparsity, aes(x = sparsity, y = value, color = method, linetype = metric)) +
+  geom_line(size = 1) +
+  geom_point() +
+  labs(title = "Precision & Recall vs. Sparsity (Fixed #Experiments), baseline",
+       y = "Metrics") +
+  theme_minimal()
+dev.off()
+
+
+
+
+```
+
+
+
+# test methods on random subseted nodes, expect precsion and recall varying with number of nodes
+
+
+
+
+```{r}
+
+
+N <- 100
+fixed_sparsity <- 0.2
+k <- 1
+subset_sizes <- c(20, 40, 60, 80, 100)
+
+
+true_graph_test <- sample_directed_graph(N, 0, sparsity = fixed_sparsity)
+rownames(true_graph_test) <- paste0("V", seq_len(N))
+seed_list = c(1,2,3,4,5)
+
+results_exp2_subset <- list()
+
+for (n_subset in subset_sizes) {
+  seed_list <- c(101, 202, 303, 404, 505)
+
+tmp_list <- lapply(seed_list, function(seed_i) {
+  set.seed(seed_i)
+
+  # Random subset of nodes
+  selected_nodes <- sort(sample(seq_len(N), n_subset, replace = FALSE))
+  
+  # Create experiment design for selected subset
+  my_exp <- fair_ordered(n_subset, n_subset, 1)
+  exp_design_subset <- my_exp$experiment_matrix
+  colnames(exp_design_subset) <- paste0("V", selected_nodes)
+
+  # Expand to full 100-node design
+  exp_design <- matrix(0, nrow = n_subset, ncol = N)
+  colnames(exp_design) <- paste0("V", seq_len(N))
+  rownames(exp_design) <- rownames(exp_design_subset)
+
+  for (i in seq_len(n_subset)) {
+    perturbed_node <- which(exp_design_subset[i, ] == 1)
+    exp_design[i, selected_nodes[perturbed_node]] <- 1
+  }
+
+  # Downstream analysis
+  print(which(exp_design == 1))
+  colnames(exp_design) <- colnames(true_graph_test)
+  exp_results <- compute_edge_reachability_matrix(exp_design, true_graph_test)
+  num_zeros <- sum(exp_results == 0)
+
+  lp_data <- prepare_edge_lp_matrices(exp_design, exp_results)
+  lp_data$f.dir <- gsub("^=$", "==", lp_data$f.dir)
+  model <- build_highs_model(lp_data)
+  result <- ROI_solve(model, solver = "highs")
+
+  solution_mat <- matrix(solution(result), 
+                         nrow = ncol(exp_design), 
+                         ncol = ncol(exp_results),
+                         dimnames = list(colnames(exp_design), colnames(exp_results)))
+
+  list(
+    seed = seed_i,
+    hard = calculate_precision_recall_hard(true_graph_test, solution_mat),
+    zero = calculate_precision_recall_zero(true_graph_test, solution_mat),
+    soft = calculate_precision_recall_soft(true_graph_test, solution_mat),
+    num_zeros = num_zeros
+  )
+})
+
+  average_metrics <- function(type, metric) {
+    mean(sapply(tmp_list, function(x) x[[type]][[metric]]))
+  }
+
+  avg_zero_count <- mean(sapply(tmp_list, function(x) x$num_zeros))
+
+  results_exp2_subset[[as.character(n_subset)]] <- data.frame(
+    num_subset_nodes = n_subset,
+    method = rep(c("hard", "zero", "soft"), each = 2),
+    metric = rep(c("precision", "recall"), 3),
+    value = c(
+      average_metrics("hard", "precision"), average_metrics("hard", "recall"),
+      average_metrics("zero", "precision"), average_metrics("zero", "recall"),
+      average_metrics("soft", "precision"), average_metrics("soft", "recall")
+    ),
+    zero_count = avg_zero_count
+  )
+
+  gc()
+}
+
+df_exp2_subset <- bind_rows(results_exp2_subset)
+
+# Save CSV
+write.csv(df_exp2_subset, "/nfs/turbo/umms-welchjd/wzqian/Casualformer/theory/results/highs_results_test/precision_recall_vs_subset_size_randomly_mapped.csv", row.names = FALSE)
+
+# Plot
+png("/nfs/turbo/umms-welchjd/wzqian/Casualformer/theory/results/highs_results_test/precision_recall_vs_subset_size_randomly_mapped.png", width = 12, height = 8, units = "in", res = 300)
+ggplot(df_exp2_subset, aes(x = num_subset_nodes, y = value, color = method, linetype = metric)) +
+  geom_line(size = 1) +
+  geom_point() +
+  labs(title = "Precision & Recall vs. #Subset Nodes Used (Fixed Graph, k=1)",
+       x = "# Subset Nodes (randomly mapped to 100)", y = "Metric Value") +
+  theme_minimal()
+dev.off()
+
+
+
+
+
+```
+
+# try lasso baseline
+
+```{r}
+sparsities <- c(0.2, 0.15, 0.10, 0.05, 0.01)
+num_exp <- 100
+my_exp <- fair_ordered(100, num_exp, 1)
+results_exp2_sparsity_lasso <- list()
+results_exp2_zero_lasso <- list()
+
+for (s in sparsities) {
+  tmp_list <- replicate(5, {
+    true_graph_test <- sample_directed_graph(100, 0, sparsity = s)
+    exp_design <- my_exp$experiment_matrix
+    colnames(exp_design) <- rownames(true_graph_test)
+    exp_results <- compute_edge_reachability_matrix(exp_design, true_graph_test)
+    num_zeros <- sum(exp_results == 0)
+
+    lasso_out <- build_lasso_edge_matrix(exp_design, exp_results)
+    edge_matrix <- lasso_out$edge_matrix
+
+    # Binary conversion
+    bin_mat <- ifelse(abs(edge_matrix) > 1e-6, 1, 0)
+
+    list(
+      metrics = calculate_precision_recall_hard(true_graph_test, bin_mat),
+      num_zeros = num_zeros
+    )
+  }, simplify = FALSE)
+
+  avg_metrics <- colMeans(do.call(rbind, lapply(tmp_list, function(x) x$metrics)))
+  avg_zero_count <- mean(sapply(tmp_list, function(x) x$num_zeros))
+
+  results_exp2_sparsity_lasso[[as.character(s)]] <- data.frame(
+    sparsity = s,
+    metric = names(avg_metrics),
+    value = unname(avg_metrics)
+  )
+
+  results_exp2_zero_lasso[[as.character(s)]] <- data.frame(
+    zero_count = avg_zero_count,
+    metric = names(avg_metrics),
+    value = unname(avg_metrics)
+  )
+
+  gc()
+}
+```
+
+
+```{r}
+df_exp2_sparsity_lasso <- bind_rows(results_exp2_sparsity_lasso)
+
+
+write.csv(df_exp2_sparsity_lasso, "/nfs/turbo/umms-welchjd/wzqian/Casualformer/theory/results/lasso_test/precision_recall_vs_sparsity_N100_lasso_baseline.csv", row.names = FALSE)
+
+
+# Plot
+png("/nfs/turbo/umms-welchjd/wzqian/Casualformer/theory/results/lasso_test/precision_recall_vs_sparsity_N100_lasso_baseline.png", width = 12, height = 8, units = "in", res = 300)
+ggplot(df_exp2_sparsity_lasso, aes(x = 1-sparsity, y = value, color = metric)) +
+  geom_line(size = 1) +
+  geom_point() +
+  labs(title = "Lasso: Precision & Recall vs. Sparsity baseline (N=100), Lasso",
+       y = "Metric", x = "Graph Sparsity") +
+  theme_minimal()
+dev.off()
+```
+
+### check for DD algorithms
+
+
+
+```{r}
+my_exp <- fair_ordered(14,10,3)
+```
+
+
+```{r}
+# sparisty is actually density here
+true_graph_test = sample_directed_graph(14,0,sparsity = 0.07)
+print(sum(true_graph_test)/(dim(true_graph_test)[1] * dim(true_graph_test)[2]))
+```
+
+```{r}
+exp_design = my_exp$experiment_matrix
+colnames(exp_design) = rownames(true_graph_test)
+```
+
+```{r}
+exp_results = compute_edge_reachability_matrix(exp_design,true_graph_test)
+```
+
+```{r}
+adj_DD = infer_edges_definite(exp_design, exp_results)
+```
+
+```{r}
+compute_precision_recall_DD <- function(pred_matrix, true_matrix) {
+  stopifnot(all(dim(pred_matrix) == dim(true_matrix)))
+
+  # Flatten
+  pred <- as.vector(pred_matrix)
+  truth <- as.vector(true_matrix)
+
+  # ------ Precision ------
+  # Precision: Only count positions where pred is 0 or 1 (exclude NA, 9999)
+  pred_valid_mask <- !is.na(pred) & pred != 9999 & !is.na(truth)
+  pred_vals <- pred[pred_valid_mask]
+  truth_vals <- truth[pred_valid_mask]
+
+  TP <- sum(pred_vals == 1 & truth_vals == 1)
+  FP <- sum(pred_vals == 1 & truth_vals == 0)
+
+  precision <- if ((TP + FP) > 0) TP / (TP + FP) else NA
+
+  # ------ Recall ------
+  # Recall: for all true edges, check if they were correctly predicted (even NA is failure)
+  true_edge_mask <- !is.na(truth) & truth == 1
+  true_edge_pred <- pred[true_edge_mask]
+
+  TP_recall <- sum(true_edge_pred == 1, na.rm = TRUE)
+  FN <- sum(is.na(true_edge_pred) | true_edge_pred == 0 | true_edge_pred == 9999)
+
+  recall <- if ((TP_recall + FN) > 0) TP_recall / (TP_recall + FN) else NA
+
+  return(list(
+    precision = precision,
+    recall = recall,
+    TP = TP,
+    FP = FP,
+    FN = FN
+  ))
+}
+```
+
+```{r}
+compute_precision_recall_DD(adj_DD,true_graph_test )
+```
+
+try bigger graph with this sparsity, the precision should be 1. Zero error rate in the experiment results.
+
+```{r}
+my_exp <- fair_ordered(222,57,8)
+```
+
+```{r}
+# sparisty is actually density here
+true_graph_test = sample_directed_graph(222,0,sparsity = 0.07)
+print(sum(true_graph_test)/(dim(true_graph_test)[1] * dim(true_graph_test)[2]))
+exp_design = my_exp$experiment_matrix
+colnames(exp_design) = rownames(true_graph_test)
+exp_results = compute_edge_reachability_matrix(exp_design,true_graph_test)
+```
+
+```{r}
+adj_DD = infer_edges_definite(exp_design, exp_results)
+```
+
+```{r}
+compute_precision_recall_DD(adj_DD,true_graph_test )
+```
+
+precision 0.95, and recall 0.03. The bug was the previous assined edges not considered in the step-2 loop. Fixed we got 1 preceision and 0.037 recall
+
+
+
+```{r}
+exp_error_results <-introduce_result_matrix_errors(exp_results)
+```
+
+```{r}
+err_exp_results = exp_error_results$err_mat
+adj_DD_err = infer_edges_definite(exp_design, err_exp_results )
+```
+only 0.75 precision
+```{r}
+compute_precision_recall_DD(adj_DD_err,true_graph_test )
+
+```
+
+```{r}
+my_exp <- fair_ordered(50,15,8)
+```
+
+
+```{r}
+# sparisty is actually density here
+true_graph_test = sample_directed_graph(50,20,sparsity = 0.07)
+print(sum(true_graph_test)/(dim(true_graph_test)[1] * dim(true_graph_test)[2]))
+exp_design = my_exp$experiment_matrix
+colnames(exp_design) = rownames(true_graph_test)
+exp_results = compute_edge_reachability_matrix(exp_design,true_graph_test)
+adj_DD = infer_edges_definite(exp_design, exp_results)
+```
+```{r}
+compute_precision_recall_DD(adj_DD,true_graph_test )
+
+```
+```{r}
+result = readRDS("/nfs/turbo/umms-welchjd-code/code/wzqian/Casualformer/theory/DD_simu/adj_DD_res.rds")
+result 
+```
+# 2nd experiments design
+
+
+
+```{r}
+my_exp <- fair_ordered(222,57,8)
+```
+
+```{r}
+# sparisty is actually density here
+true_graph_test = sample_directed_graph(222,0,sparsity = 0.07)
+ print(sum(true_graph_test)/(dim(true_graph_test)[1] * dim(true_graph_test)[2]))
+ exp_design = my_exp$experiment_matrix
+colnames(exp_design) = rownames(true_graph_test)
+exp_results = compute_edge_reachability_matrix(exp_design,true_graph_test)
+```
+
+```{r}
+adj_DD = infer_edges_definite(exp_design, exp_results)
+```
+
+```{r}
+saveRDS(true_graph_test, "/nfs/turbo/umms-welchjd-code/code/wzqian/Casualformer/theory/secondary_design/example_graph_s093.rds")
+saveRDS( exp_design, "/nfs/turbo/umms-welchjd-code/code/wzqian/Casualformer/theory/secondary_design/example_exp_design_s093.rds")
+saveRDS( exp_results, "/nfs/turbo/umms-welchjd-code/code/wzqian/Casualformer/theory/secondary_design/example_exp_results_s093.rds")
+saveRDS(adj_DD,"/nfs/turbo/umms-welchjd-code/code/wzqian/Casualformer/theory/secondary_design/example_graph_1st_s093.rds" )
+```
+
+```{r}
+true_graph_test = readRDS("/nfs/turbo/umms-welchjd-code/code/wzqian/Casualformer/theory/secondary_design/example_graph_s093.rds")
+exp_design = readRDS("/nfs/turbo/umms-welchjd-code/code/wzqian/Casualformer/theory/secondary_design/example_exp_design_s093.rds")
+exp_results = readRDS("/nfs/turbo/umms-welchjd-code/code/wzqian/Casualformer/theory/secondary_design/example_exp_results_s093.rds")
+adj_DD = readRDS("/nfs/turbo/umms-welchjd-code/code/wzqian/Casualformer/theory/secondary_design/example_graph_1st_s093.rds")
+score_matrix = readRDS("/nfs/turbo/umms-welchjd-code/code/wzqian/Casualformer/theory/secondary_design/example_positive_matrix_s093.rds")
+```
+
+```{r}
+compute_precision_recall_DD(adj_DD,true_graph_test )
+```
+
+
+
+```{r}
+(sum(is.na(adj_DD)) - dim(adj_DD)[1])/(dim(adj_DD)[1]^2)
+```
+
+```{r}
+boxplot(rowSums(is.na(adj_DD)))
+```
+```{r}
+rowSums(adj_DD,na.rm = T)
+```
+
+
+```{r}
+# means all the nodes need to be perturbed once more at least
+sum(rowSums(is.na(adj_DD)) == 1)
+```
+
+
+```{r}
+score_matrix = compute_expected_positive_matrix(exp_design = exp_design, exp_results = exp_results,adj = adj_DD)
+```
+
+```{r}
+saveRDS(score_matrix,"/nfs/turbo/umms-welchjd-code/code/wzqian/Casualformer/theory/secondary_design/example_positive_matrix_s093.rds" )
+```
+
+```{r}
+score_matrix = readRDS("/nfs/turbo/umms-welchjd-code/code/wzqian/Casualformer/theory/secondary_design/example_positive_matrix_s093.rds")
+```
+
+
+# 2nd experiments design 1, perturb all nodes with k from 1-8 and minimaize the expected positives
+
+```{r}
+ # Step 1: Generate all disjoint sets automatically from exp_design
+disjoint_sets <- generate_all_disjoint_experiments(exp_design)
+
+# Step 2: View available sizes
+table(attr(disjoint_sets, "set_k"))
+```
+```{r}
+rownames(adj_DD)[!(rownames(adj_DD)%in% unique(unlist(disjoint_sets)))]
+```
+
+```{r}
+for (i in seq_along(disjoint_sets)) {
+  set <- disjoint_sets[[i]]
+  if (length(set) < 8) {
+    original_score <- sum(score_matrix[set, set], na.rm = TRUE)
+    new_set <- union(set, "TF205")
+    new_score <- sum(score_matrix[new_set, new_set], na.rm = TRUE)
+    if (new_score <= original_score) {
+      disjoint_sets[[i]] <- new_set
+      print(paste0("add to ", i))
+      break  # added successfully
+    }
+  }
+}
+```
+
+```{r}
+for (i in seq_along(disjoint_sets)) {
+  set <- disjoint_sets[[i]]
+  if (length(set) < 8) {
+    original_score <- sum(score_matrix[set, set], na.rm = TRUE)
+    new_set <- union(set, "TF214")
+    new_score <- sum(score_matrix[new_set, new_set], na.rm = TRUE)
+    if (new_score <= original_score) {
+      disjoint_sets[[i]] <- new_set
+      print(paste0("add to ", i))
+      break  # added successfully
+    }
+  }
+}
+```
+
+```{r}
+final_sets <- find_smallest_covering_subset(all_sets = disjoint_sets, regulators = rownames(adj_DD), n_shuffle = 2500)
+length(final_sets)
+```
+
+```{r}
+saveRDS(final_sets,"/nfs/turbo/umms-welchjd-code/code/wzqian/Casualformer/theory/secondary_design/example_smallest_start_sets093.rds" )
+```
+
+
+
+```{r}
+start_2nd_exps = convert_to_design_matrix(final_sets,colnames(exp_design))
+```
+
+```{r}
+score_based_exps = build_score_based_design(score_matrix = score_matrix, regulators = rownames(adj_DD),n_repeats = 1000)
+```
+
+```{r}
+# The last several exps will have high svores
+rowSums(score_based_exps$design_matrix)
+```
+
+```{r}
+
+saveRDS(score_based_exps,"/nfs/turbo/umms-welchjd-code/code/wzqian/Casualformer/theory/secondary_design/example_score_based_exps_r1000_093.rds" )
+```
+
+
+
+```{r}
+# need to fix the issues of shuffled colnames
+
+score_based_exps = readRDS("/nfs/turbo/umms-welchjd-code/code/wzqian/Casualformer/theory/secondary_design/example_score_based_exps_r1000_093.rds")
+score_based_exps$design_matrix = score_based_exps$design_matrix[,colnames(exp_design)]
+exp_design_2nd_all = rbind(exp_design,score_based_exps$design_matrix)
+
+exp_results_2nd = compute_edge_reachability_matrix(exp_design_2nd_all,true_graph_test)
+adj_DD_2nd = infer_edges_definite(exp_design_2nd_all, exp_results_2nd)
+
+```
+
+```{r}
+compute_precision_recall_DD(adj_DD_2nd ,true_graph_test )
+```
+
+```{r}
+saveRDS(adj_DD_2nd,"/nfs/turbo/umms-welchjd-code/code/wzqian/Casualformer/theory/secondary_design/example_adj_DD_2nd_093.rds" )
+```
+
+# notes
+need to compare just perturb the last several experiments, plot the recall v.s scores
+
+```{r}
+#baseline
+score_based_exps= build_score_based_design(score_matrix = score_matrix, regulators = rownames(adj_DD),n_repeats = 1)
+print(score_based_exps$total_score)
+score_based_exps$design_matrix = score_based_exps$design_matrix[,colnames(exp_design)]
+exp_design_2nd_all = rbind(exp_design,score_based_exps$design_matrix)
+
+exp_results_2nd = compute_edge_reachability_matrix(exp_design_2nd_all,true_graph_test)
+adj_DD_2nd = infer_edges_definite(exp_design_2nd_all, exp_results_2nd)
+```
+
+```{r}
+ sum(exp_results_2nd,na.rm = TRUE )
+```
+
+
+```{r}
+# baseline metrics
+compute_precision_recall_DD(adj_DD_2nd ,true_graph_test )
+
+```
+```{r}
+ low_score_matrix = readRDS("/nfs/turbo/umms-welchjd-code/code/wzqian/Casualformer/theory/secondary_design/example_score_based_exps_r1000_093.rds")
+```
+
+```{r}
+tmp1 = which(score_based_exps$design_matrix == 1, arr.ind = TRUE)
+tmp2 = which( low_score_matrix$design_matrix == 1, arr.ind = TRUE) 
+```
+
+```{r}
+all(tmp1 == tmp2)
+```
+
+```{r}
+identical(score_based_exps$design_matrix,low_score_matrix$design_matrix)
+```
+
+
+```{r}
+df1 <- as.data.frame(score_based_exps$design_matrix)
+df2 <- as.data.frame(low_score_matrix$design_matrix)
+
+anti_join(df1, df2)  # rows in df1 not in df2
+```
+
+```{r}
+
+generate_baseline_design <- function(regulators, max_size = 8) {
+  shuffled <- sample(regulators)
+  n <- length(shuffled)
+
+  # Full experiment sets (chunks of size max_size)
+  n_full <- floor(n / max_size)
+  full_chunks <- split(shuffled[1:(n_full * max_size)],
+                       rep(1:n_full, each = max_size))
+
+  # Remaining regulators (singleton experiments)
+  leftovers <- shuffled[(n_full * max_size + 1):n]
+
+  design_list <- c(full_chunks, as.list(leftovers))
+
+  # Convert to binary matrix
+  all_genes <- unique(unlist(design_list))
+  exp_mat <- matrix(0, nrow = length(design_list), ncol = length(all_genes),
+                    dimnames = list(paste0("exp", seq_along(design_list)), all_genes))
+
+  for (i in seq_along(design_list)) {
+    exp_mat[i, design_list[[i]]] <- 1
+  }
+
+  return(exp_mat)
+}
+
+```
+
+
+```{r}
+baseline_exp_design <- generate_baseline_design(rownames(adj_DD), max_size = 8)
+baseline_exp_design = baseline_exp_design[,colnames(adj_DD)]
+```
+
+```{r}
+
+print(compute_experiment_scores(baseline_exp_design,score_matrix ))
+print(sum(compute_experiment_scores(baseline_exp_design,score_matrix )))
+```
+
+```{r}
+
+exp_design_2nd_all_base = rbind(exp_design,baseline_exp_design)
+
+exp_results_2nd_base = compute_edge_reachability_matrix(exp_design_2nd_all_base ,true_graph_test)
+adj_DD_2nd_base = infer_edges_definite(exp_design_2nd_all_base, exp_results_2nd_base)
+```
+
+
+```{r}
+compute_precision_recall_DD(adj_DD_2nd_base ,true_graph_test )
+```
+
+```{r}
+ sum(exp_results_2nd_base,na.rm = TRUE )
+```
+
+
+```{r}
+saveRDS(score_based_exps, "/nfs/turbo/umms-welchjd-code/code/wzqian/Casualformer/theory/secondary_design/example_score_based_exps_r1_093.rds")
+saveRDS(exp_design_2nd_all , "/nfs/turbo/umms-welchjd-code/code/wzqian/Casualformer/theory/secondary_design/example_exp_design_2nd_all_r1_093.rds")
+saveRDS(exp_results_2nd  , "/nfs/turbo/umms-welchjd-code/code/wzqian/Casualformer/theory/secondary_design/example_exp_results_2nd_r1_093.rds")
+saveRDS(adj_DD_2nd,"/nfs/turbo/umms-welchjd-code/code/wzqian/Casualformer/theory/secondary_design/example_eadj_DD_2nd_r1_093.rds")
+```
+
+
+
+
+```{r}
+score_matrix_2nd = compute_expected_positive_matrix(exp_design = exp_design_2nd_all, exp_results = exp_results_2nd, adj = adj_DD_2nd)
+```
+
+```{r}
+saveRDS(score_matrix_2nd,"/nfs/turbo/umms-welchjd-code/code/wzqian/Casualformer/theory/secondary_design/example_score_matrix_2nd_093.rds")
+```
+
+
+```{r}
+true_graph_test = readRDS("/nfs/turbo/umms-welchjd-code/code/wzqian/Casualformer/theory/secondary_design/example_graph_s093.rds")
+exp_design_2nd_all = readRDS("/nfs/turbo/umms-welchjd-code/code/wzqian/Casualformer/theory/secondary_design/example_exp_design_2nd_all_r1_093.rds")
+exp_results_2nd = readRDS("/nfs/turbo/umms-welchjd-code/code/wzqian/Casualformer/theory/secondary_design/example_exp_results_2nd_r1_093.rds")
+adj_DD_2nd= readRDS("/nfs/turbo/umms-welchjd-code/code/wzqian/Casualformer/theory/secondary_design/example_eadj_DD_2nd_r1_093.rds")
+score_matrix_2nd = readRDS("/nfs/turbo/umms-welchjd-code/code/wzqian/Casualformer/theory/secondary_design/example_score_matrix_2nd_093.rds")
+```
+
+```{r}
+which(rowSums(is.na(adj_DD_2nd)) == 1)
+```
+
+
+```{r}
+score_based_exps_3rd = build_score_based_design(score_matrix = score_matrix_2nd, regulators = rownames(adj_DD_2nd)[rowSums(is.na(adj_DD_2nd)) != 1],all_regulators = colnames(adj_DD_2nd),n_repeats = 500)
+```
+
+
+```{r}
+print(score_based_exps_3rd $total_score)
+```
+
+```{r}
+
+exp_design_3rd_all = rbind(exp_design_2nd_all,score_based_exps_3rd$design_matrix)
+
+exp_results_3rd = compute_edge_reachability_matrix(exp_design_3rd_all,true_graph_test)
+
+adj_DD_3rd = infer_edges_definite(exp_design_3rd_all, exp_results_3rd)
+```
+
+```{r}
+compute_precision_recall_DD(adj_DD_3rd  ,true_graph_test )
+```
+```{r}
+dim(exp_design_3rd_all)
+```
+
+
+```{r}
+saveRDS(score_based_exps_3rd, "/nfs/turbo/umms-welchjd-code/code/wzqian/Casualformer/theory/secondary_design/example_score_based_exps_3rd_r500_093.rds")
+saveRDS(exp_design_3rd_all  , "/nfs/turbo/umms-welchjd-code/code/wzqian/Casualformer/theory/secondary_design/example_exp_design_3rd_all _r500_093.rds")
+saveRDS(exp_results_3rd  , "/nfs/turbo/umms-welchjd-code/code/wzqian/Casualformer/theory/secondary_design/example_exp_results_3rd r500_093.rds")
+saveRDS(adj_DD_3rd ,"/nfs/turbo/umms-welchjd-code/code/wzqian/Casualformer/theory/secondary_design/example_eadj_DD_3rd_r500_093.rds")
+```
+
+
+```{r}
+generate_baseline_design <- function(regulators, all_regulators, max_size = 8) {
+  # ✅ Assert all regulators are valid
+  if (!all(regulators %in% all_regulators)) {
+    missing <- setdiff(regulators, all_regulators)
+    stop("The following regulators are not in all_regulators:\n",
+         paste(missing, collapse = ", "))
+  }
+
+  shuffled <- sample(regulators)
+  n <- length(shuffled)
+
+  n_full <- floor(n / max_size)
+  full_chunks <- split(shuffled[1:(n_full * max_size)],
+                       rep(1:n_full, each = max_size))
+
+  # Proper handling when there's no leftover
+  if (n_full * max_size < n) {
+    leftovers <- shuffled[(n_full * max_size + 1):n]
+    design_list <- c(full_chunks, as.list(leftovers))
+  } else {
+    design_list <- full_chunks
+  }
+
+  # Build binary matrix with consistent columns
+  exp_mat <- matrix(0, nrow = length(design_list), ncol = length(all_regulators),
+                    dimnames = list(paste0("exp", seq_along(design_list)), all_regulators))
+
+  for (i in seq_along(design_list)) {
+    genes <- design_list[[i]]
+    if (length(genes) > 0) {
+      exp_mat[i, genes] <- 1
+    }
+  }
+
+  return(exp_mat)
+}
+
+```
+
+
+```{r}
+baseline_exp_design <- generate_baseline_design(rownames(adj_DD_2nd)[rowSums(is.na(adj_DD_2nd)) != 1], all_regulators = colnames(adj_DD_3rd), max_size = 8)
+
+print(compute_experiment_scores(baseline_exp_design,score_matrix_2nd ))
+print(sum(compute_experiment_scores(baseline_exp_design,score_matrix_2nd )))
+```
+
+exp_design_3rd_all = rbind(exp_design_2nd_all,score_based_exps_3rd$design_matrix)
+
+exp_results_3rd = compute_edge_reachability_matrix(exp_design_3rd_all,true_graph_test)
+
+adj_DD_3rd = infer_edges_definite(exp_design_3rd_all, exp_results_3rd)
+
+
+
+```{r}
+exp_design_3rd_all_base = rbind(exp_design_2nd_all,baseline_exp_design)
+
+exp_results_3rd_base = compute_edge_reachability_matrix(exp_design_3rd_all_base ,true_graph_test)
+adj_DD_3rd_base = infer_edges_definite(exp_design_3rd_all_base, exp_results_3rd_base )
+```
+
+```{r}
+compute_precision_recall_DD(adj_DD_3rd_base, true_graph_test )
+```
+```{r}
+print(compute_experiment_scores(baseline_exp_design,score_matrix_2nd ))
+print(compute_experiment_scores(score_based_exps_3rd$design_matrix,score_matrix_2nd ))
+```
+
+# 2nd experimental design, try just using single gene perturbation
+
+
+```{r}
+true_graph_test = readRDS("/nfs/turbo/umms-welchjd-code/code/wzqian/Casualformer/theory/secondary_design/example_graph_s093.rds")
+exp_design = readRDS("/nfs/turbo/umms-welchjd-code/code/wzqian/Casualformer/theory/secondary_design/example_exp_design_s093.rds")
+exp_results = readRDS("/nfs/turbo/umms-welchjd-code/code/wzqian/Casualformer/theory/secondary_design/example_exp_results_s093.rds")
+adj_DD = readRDS("/nfs/turbo/umms-welchjd-code/code/wzqian/Casualformer/theory/secondary_design/example_graph_1st_s093.rds")
+score_matrix = readRDS("/nfs/turbo/umms-welchjd-code/code/wzqian/Casualformer/theory/secondary_design/example_positive_matrix_s093.rds")
+```
+
+
+```{r}
+rowSums(is.na(adj_DD))
+colSums(score_matrix)
+```
+
+
+```{r}
+exp_design_2nd = generate_single_gene_design_2nd(adj_DD = adj_DD, score_matrix = score_matrix)
+```
+
+```{r}
+exp_design_2nd_all = rbind(exp_design,exp_design_2nd )
+
+exp_results_2nd = compute_edge_reachability_matrix(exp_design_2nd_all,true_graph_test)
+adj_DD_2nd = infer_edges_definite(exp_design_2nd_all, exp_results_2nd)
+```
+
+```{r}
+compute_precision_recall_DD(adj_DD_2nd , true_graph_test )
+```
+
+# try prob score matrix
+
+```{r}
+prob_score = compute_prob_score_matrix(exp_design = exp_design,exp_results = exp_results,adj_graph = adj_DD)
+```
+
+```{r}
+saveRDS(prob_score, "/nfs/turbo/umms-welchjd-code/code/wzqian/Casualformer/theory/secondary_design/example_prob_score_s093.rds")
+```
+
+```{r}
+prob_score = readRDS("/nfs/turbo/umms-welchjd-code/code/wzqian/Casualformer/theory/secondary_design/example_prob_score_s093.rds")
+```
+
+```{r}
+result <- build_prob_based_design(
+  prob_score_matrix = prob_score,
+  regulators = rownames(prob_score),
+  adj_graph = adj_DD,
+  all_regulators = colnames(prob_score),
+  max_size = 8,
+  n_repeats = 1,
+  split = FALSE
+)
+
+```
+
+```{r}
+print(result$total_score)
+```
+
+
+```{r}
+exp_design_2nd_all = rbind(exp_design,result$design_matrix )
+
+exp_results_2nd = compute_edge_reachability_matrix(exp_design_2nd_all,true_graph_test)
+adj_DD_2nd = infer_edges_definite(exp_design_2nd_all, exp_results_2nd)
+```
+
+```{r}
+compute_precision_recall_DD(adj_DD_2nd , true_graph_test )
+```
+
+```{r}
+result <- build_prob_based_design(
+  prob_score_matrix = prob_score,
+  regulators = rownames(prob_score),
+  adj_graph = adj_DD,
+  all_regulators = colnames(prob_score),
+  max_size = 8,
+  n_repeats = 1,
+  split = FALSE
+)
+print(result$total_score)
+```
+
+```{r}
+exp_design_2nd_all = rbind(exp_design,result$design_matrix )
+
+exp_results_2nd = compute_edge_reachability_matrix(exp_design_2nd_all,true_graph_test)
+adj_DD_2nd = infer_edges_definite(exp_design_2nd_all, exp_results_2nd)
+```
+
+
+```{r}
+compute_precision_recall_DD(adj_DD_2nd , true_graph_test )
+```
+
+
+# try 3rd round 
+```{r}
+prob_score_2nd = compute_prob_score_matrix(exp_design = exp_design_2nd_all,exp_results = exp_results_2nd,adj_graph = adj_DD_2nd)
+```
+
+
+
+```{r}
+result <- build_prob_based_design(
+  prob_score_matrix = prob_score_2nd,
+  regulators = rownames(prob_score_2nd),
+  adj_graph = adj_DD_2nd,
+  all_regulators = colnames(prob_score_2nd),
+  max_size = 8,
+  n_repeats = 2000,
+  split = FALSE
+)
+print(result$total_score)
+```
+
+
+
+```{r}
+exp_design_3rd_all = rbind(exp_design_2nd_all,result$design_matrix )
+
+exp_results_3rd = compute_edge_reachability_matrix(exp_design_3rd_all ,true_graph_test)
+adj_DD_3rd = infer_edges_definite(exp_design_3rd_all, exp_results_3rd)
+```
+
+```{r}
+compute_precision_recall_DD(adj_DD_3rd , true_graph_test )
+```
+
+
+```{r}
+calculate_T_bound(E = sum(true_graph_test==1, na.rm = T),N_non_TF = 0,N_TF = 222,V = 222,k = 8)
+```
+
+```{r}
+df1 = read.csv("/nfs/turbo/umms-welchjd-code/code/wzqian/Casualformer/theory/DD_simu/prob_design_benchmark_metrics_b1.csv")
+df2 = read.csv("/nfs/turbo/umms-welchjd-code/code/wzqian/Casualformer/theory/DD_simu/prob_design_benchmark_metrics_b2.csv")
+df3 = read.csv("/nfs/turbo/umms-welchjd-code/code/wzqian/Casualformer/theory/DD_simu/prob_design_benchmark_metrics_b4.csv")
+df4 = read.csv("/nfs/turbo/umms-welchjd-code/code/wzqian/Casualformer/theory/DD_simu/prob_design_benchmark_metrics_b4.csv")
+df5 = read.csv("/nfs/turbo/umms-welchjd-code/code/wzqian/Casualformer/theory/DD_simu/prob_design_benchmark_metrics_b5.csv")
+df = rbind(df1,df2,df3,df4,df5)
+df_2nd = df[df$round == "2nd",]
+df_3rd = df[df$round == "3rd",]
+```
+
+
+```{r}
+p1 <- ggplot(data = df_2nd) + geom_point(aes(x = total_score, y = recall )) +
+  geom_smooth(method='lm', aes(x = total_score, y = recall ),formula= y ~ x) + 
+  labs(x = "Score", y = "Recall",title = 'recall ~ score in 2nd experiment design') + 
+  theme(
+            plot.title = element_text(size = 15,face = "bold", vjust = 0.5, hjust = 0.5),
+            axis.title.x = element_text(size = 12,face = "bold"),
+            axis.title.y = element_text(size = 12,face = "bold"),
+            axis.text.x=element_text(size = 12,face = "bold"),
+            axis.text.y=element_text(size = 12,face = "bold"),
+            legend.title = element_text(size = 12,face = "bold"),
+            legend.text = element_text(size = 12),
+            panel.background = element_rect(fill='transparent', color = "black"), #transparent panel bg
+            plot.background = element_rect(fill='transparent', color=NA),#transparent plot bg
+            legend.background = element_rect(fill='transparent'), #transparent legend bg
+            legend.box.background = element_rect(fill='transparent') ,#transparent legend panel
+            legend.position = "none"
+            )
+print(p1)
+png("/nfs/turbo/umms-welchjd-code/code/wzqian/Casualformer/theory/DD_simu/fig/prob_score_2nd.png", width= 1600, height = 900,res = 300)
+print(p1)
+dev.off()
+
+p2 <- ggplot(data = df_3rd) + geom_point(aes(x = total_score, y = recall )) +
+  geom_smooth(method='lm', aes(x = total_score, y = recall ),formula= y ~ x) + 
+  labs(x = "Score", y = "Recall",title = 'recall ~ score in 3rd experiment design') + 
+  theme(
+            plot.title = element_text(size = 15,face = "bold", vjust = 0.5, hjust = 0.5),
+            axis.title.x = element_text(size = 12,face = "bold"),
+            axis.title.y = element_text(size = 12,face = "bold"),
+            axis.text.x=element_text(size = 12,face = "bold"),
+            axis.text.y=element_text(size = 12,face = "bold"),
+            legend.title = element_text(size = 12,face = "bold"),
+            legend.text = element_text(size = 12),
+            panel.background = element_rect(fill='transparent', color = "black"), #transparent panel bg
+            plot.background = element_rect(fill='transparent', color=NA),#transparent plot bg
+            legend.background = element_rect(fill='transparent'), #transparent legend bg
+            legend.box.background = element_rect(fill='transparent') ,#transparent legend panel
+            legend.position = "none"
+            )
+print(p2)
+png("/nfs/turbo/umms-welchjd-code/code/wzqian/Casualformer/theory/DD_simu/fig/prob_score_3rd.png", width= 1600, height = 900,res = 300)
+print(p2)
+dev.off()
+```
+
+```{r}
+model_2nd= lm(recall ~  total_score, data = df_2nd)
+summary(model_2nd)
+model_3rd= lm(recall ~  total_score, data = df_3rd)
+summary(model_3rd)
+```
+```{r}
+tmp = readRDS("/nfs/turbo/umms-welchjd-code/code/wzqian/Casualformer/theory/DD_simu/results_DD_222_093_117_500reps.rds")
+png("/nfs/turbo/umms-welchjd-code/code/wzqian/Casualformer/theory/DD_simu/fig/117_500ODP_recall.png", width= 1200, height = 900,res = 300)
+boxplot(tmp$recall)
+title("recall on 500 different ODPS, N = 117")
+dev.off()
+tmp = readRDS("/nfs/turbo/umms-welchjd-code/code/wzqian/Casualformer/theory/DD_simu/results_DD_222_093_90_500reps.rds")
+png("/nfs/turbo/umms-welchjd-code/code/wzqian/Casualformer/theory/DD_simu/fig/90_500ODP_recall.png", width= 1200, height = 900,res = 300)
+boxplot(tmp$recall)
+title("recall on 500 different ODPS, N = 90")
+dev.off()
+```
+
+# baseline, group unconflicted experiments together
+
+```{r}
+true_graph_test <- readRDS("/nfs/turbo/umms-welchjd-code/code/wzqian/Casualformer/theory/secondary_design/example_graph_s093.rds")
+exp_design       <- readRDS("/nfs/turbo/umms-welchjd-code/code/wzqian/Casualformer/theory/secondary_design/example_exp_design_s093.rds")
+exp_results      <- readRDS("/nfs/turbo/umms-welchjd-code/code/wzqian/Casualformer/theory/secondary_design/example_exp_results_s093.rds")
+adj_DD           <- readRDS("/nfs/turbo/umms-welchjd-code/code/wzqian/Casualformer/theory/secondary_design/example_graph_1st_s093.rds")
+
+```
+
+
+```{r}
+out <- design_second_round_greedy_target_first(adj_DD, exp_design, exp_results, k = 8)
+```
+```{r}
+exp_design_2nd<- split_last_short_group(out$design_matrix, k = 8)
+```
+
+```{r}
+exp_design_2nd_all = rbind(exp_design,exp_design_2nd )
+
+exp_results_2nd = compute_edge_reachability_matrix(exp_design_2nd_all,true_graph_test)
+adj_DD_2nd = infer_edges_definite(exp_design_2nd_all, exp_results_2nd)
+```
+
+```{r}
+compute_precision_recall_DD(adj_DD_2nd , true_graph_test )
+```
+```{r}
+out_3rd <- design_second_round_greedy_target_first(adj_DD_2nd, exp_design_2nd_all, exp_results_2nd, k = 8)
+exp_design_3rd<- split_last_short_group(out_3rd$design_matrix, k = 8)
+```
+
+
+
+```{r}
+exp_design_3rd_all = rbind(exp_design_2nd_all,exp_design_3rd)
+
+exp_results_3rd = compute_edge_reachability_matrix(exp_design_3rd_all ,true_graph_test)
+adj_DD_3rd = infer_edges_definite(exp_design_3rd_all, exp_results_3rd)
+```
+
+```{r}
+compute_precision_recall_DD(adj_DD_3rd, true_graph_test )
+```
+# single + multi
+```{r}
+df1 = read.csv("/nfs/turbo/umms-welchjd-code/code/wzqian/Casualformer/theory/DD_simu/single_then_multi/prob_score_methods/prob_design_benchmark_metrics_b1.csv")
+df2 = read.csv("/nfs/turbo/umms-welchjd-code/code/wzqian/Casualformer/theory/DD_simu/single_then_multi/prob_score_methods/prob_design_benchmark_metrics_b2.csv")
+df3 = read.csv("/nfs/turbo/umms-welchjd-code/code/wzqian/Casualformer/theory/DD_simu/single_then_multi/prob_score_methods/prob_design_benchmark_metrics_b3.csv")
+df4 = read.csv("/nfs/turbo/umms-welchjd-code/code/wzqian/Casualformer/theory/DD_simu/single_then_multi/prob_score_methods/prob_design_benchmark_metrics_b4.csv")
+df5 = read.csv("/nfs/turbo/umms-welchjd-code/code/wzqian/Casualformer/theory/DD_simu/single_then_multi/prob_score_methods/prob_design_benchmark_metrics_b5.csv")
+df = rbind(df1,df2,df3,df4,df5)
+df_2nd = df[df$round == "2nd",]
+df_3rd = df[df$round == "3rd",]
+```
+
+```{r}
+unique(df_2nd$n_new_experiments)
+unique(df_3rd$n_new_experiments)
+```
+
+
+```{r}
+mean(df_2nd$recall)
+mean(df_3rd$recall)
+```
+
+```{r}
+df_greedy  = read.csv("/nfs/turbo/umms-welchjd-code/code/wzqian/Casualformer/theory/DD_simu/single_then_multi/greedy_baseline/greedy_benchmark_metrics.csv")
+df_greedy_2nd = df_greedy [df_greedy $round == "2nd",]
+df_greedy_3rd = df_greedy [df_greedy $round == "3rd",]
+```
+
+```{r}
+unique(df_greedy_2nd$n_new_experiments)
+unique(df_greedy_3rd$n_new_experiments)
+mean(df_greedy_2nd$recall)
+mean(df_greedy_3rd$recall)
+```
+
+```{r}
+p1 <- ggplot(data = df_2nd) + geom_point(aes(x = total_score, y = recall )) +
+  geom_smooth(method='lm', aes(x = total_score, y = recall ),formula= y ~ x) + 
+  labs(x = "Score", y = "Recall",title = 'recall ~ score in 2nd experiment design') + 
+  theme(
+            plot.title = element_text(size = 15,face = "bold", vjust = 0.5, hjust = 0.5),
+            axis.title.x = element_text(size = 12,face = "bold"),
+            axis.title.y = element_text(size = 12,face = "bold"),
+            axis.text.x=element_text(size = 12,face = "bold"),
+            axis.text.y=element_text(size = 12,face = "bold"),
+            legend.title = element_text(size = 12,face = "bold"),
+            legend.text = element_text(size = 12),
+            panel.background = element_rect(fill='transparent', color = "black"), #transparent panel bg
+            plot.background = element_rect(fill='transparent', color=NA),#transparent plot bg
+            legend.background = element_rect(fill='transparent'), #transparent legend bg
+            legend.box.background = element_rect(fill='transparent') ,#transparent legend panel
+            legend.position = "none"
+            )
+print(p1)
+png("/nfs/turbo/umms-welchjd-code/code/wzqian/Casualformer/theory/DD_simu/fig/prob_score_2nd_single_multi.png", width= 1600, height = 900,res = 300)
+print(p1)
+dev.off()
+
+p2 <- ggplot(data = df_3rd) + geom_point(aes(x = total_score, y = recall )) +
+  geom_smooth(method='lm', aes(x = total_score, y = recall ),formula= y ~ x) + 
+  labs(x = "Score", y = "Recall",title = 'recall ~ score in 3rd experiment design') + 
+  theme(
+            plot.title = element_text(size = 15,face = "bold", vjust = 0.5, hjust = 0.5),
+            axis.title.x = element_text(size = 12,face = "bold"),
+            axis.title.y = element_text(size = 12,face = "bold"),
+            axis.text.x=element_text(size = 12,face = "bold"),
+            axis.text.y=element_text(size = 12,face = "bold"),
+            legend.title = element_text(size = 12,face = "bold"),
+            legend.text = element_text(size = 12),
+            panel.background = element_rect(fill='transparent', color = "black"), #transparent panel bg
+            plot.background = element_rect(fill='transparent', color=NA),#transparent plot bg
+            legend.background = element_rect(fill='transparent'), #transparent legend bg
+            legend.box.background = element_rect(fill='transparent') ,#transparent legend panel
+            legend.position = "none"
+            )
+print(p2)
+png("/nfs/turbo/umms-welchjd-code/code/wzqian/Casualformer/theory/DD_simu/fig/prob_score_3rd_single_multi.png", width= 1600, height = 900,res = 300)
+print(p2)
+dev.off()
+```
+1st round mixed
+
+```{r}
+df1 = read.csv("/nfs/turbo/umms-welchjd-code/code/wzqian/Casualformer/theory/DD_simu/mixed_1st/prob_score_based/prob_design_benchmark_metrics_b1.csv")
+df2 = read.csv("/nfs/turbo/umms-welchjd-code/code/wzqian/Casualformer/theory/DD_simu/mixed_1st/prob_score_based/prob_design_benchmark_metrics_b2.csv")
+df3 = read.csv("/nfs/turbo/umms-welchjd-code/code/wzqian/Casualformer/theory/DD_simu/mixed_1st/prob_score_based/prob_design_benchmark_metrics_b3.csv")
+df4 = read.csv("/nfs/turbo/umms-welchjd-code/code/wzqian/Casualformer/theory/DD_simu/mixed_1st/prob_score_based/prob_design_benchmark_metrics_b4.csv")
+df5 = read.csv("/nfs/turbo/umms-welchjd-code/code/wzqian/Casualformer/theory/DD_simu/mixed_1st/prob_score_based/prob_design_benchmark_metrics_b5.csv")
+df = rbind(df1,df2,df3,df4,df5)
+df_2nd = df[df$round == "2nd",]
+df_3rd = df[df$round == "3rd",]
+```
+
+```{r}
+unique(df_2nd$n_new_experiments)
+unique(df_3rd$n_new_experiments)
+mean(df_2nd$recall)
+mean(df_3rd$recall)
+```
+
+
+
+```{r}
+df_greedy  = read.csv("/nfs/turbo/umms-welchjd-code/code/wzqian/Casualformer/theory/DD_simu/mixed_1st/greedy_baseline/greedy_benchmark_metrics.csv")
+df_greedy_2nd = df_greedy [df_greedy $round == "2nd",]
+df_greedy_3rd = df_greedy [df_greedy $round == "3rd",]
+```
+
+```{r}
+unique(df_greedy_2nd$n_new_experiments)
+unique(df_greedy_3rd$n_new_experiments)
+mean(df_greedy_2nd$recall)
+mean(df_greedy_3rd$recall)
+```
+
+# experiments added for DD theories
+
+```{r}
+true_graph_test <- sample_directed_graph(250, 0, sparsity = 0.2)
+
+experiment_counts <- seq(65, 165, by = 20)
+results_exp1 <- list()
+
+for (num_exp in experiment_counts) {
+  my_exp <- fair_ordered(250, num_exp, 8)
+  exp_design <- my_exp$experiment_matrix
+  colnames(exp_design) <- rownames(true_graph_test)
+
+  exp_results <- compute_edge_reachability_matrix(exp_design, true_graph_test)
+  adj_DD <- infer_edges_definite(exp_design, exp_results)
+
+  metrics <- compute_precision_recall_DD(adj_DD, true_graph_test)
+  F1 <- if (!is.na(metrics$precision) && !is.na(metrics$recall) &&
+              (metrics$precision + metrics$recall) > 0) {
+    2 * metrics$precision * metrics$recall / (metrics$precision + metrics$recall)
+  } else NA
+
+  results_exp1[[as.character(num_exp)]] <- data.frame(
+    experiments = num_exp,
+    metric = c("precision", "recall", "F1"),
+    value = c(metrics$precision, metrics$recall, F1)
+  )
+}
+
+df_exp1 <- bind_rows(results_exp1)
+out_csv <- "/nfs/turbo/umms-welchjd-code/code/wzqian/Casualformer/theory/DD_simu/lower_bound_identify/precision_recall_F1_vs_experiments_N250_sp0.2.csv"
+write.csv(df_exp1, out_csv, row.names = FALSE)
+
+# 理论下界
+T_bound <- calculate_T_bound(sum(true_graph_test == 1), 250, 0, 250, 8)
+
+out_png <- "/nfs/turbo/umms-welchjd-code/code/wzqian/Casualformer/theory/DD_simu/lower_bound_identify/precision_recall_F1_vs_experiments_N250_sp0.2.png"
+png(out_png, width = 12, height = 8, units = "in", res = 300)
+ggplot(df_exp1, aes(x = experiments, y = value, color = metric)) +
+  geom_line(size = 1) +
+  geom_point() +
+  geom_vline(xintercept = T_bound, size = 2) +
+  annotate("text", x = T_bound, y = max(df_exp1$value, na.rm = TRUE) * 0.2,
+           label = paste("Lower Bound =", T_bound, 
+                         ", Sparsity =", calculate_sparsity(true_graph_test)),
+           vjust = -0.5, angle = 90, hjust = -0.1) +
+  labs(title = "Precision, Recall & F1 vs. #Experiments (DD alg, Fixed Graph)",
+       y = "Score") +
+  theme_minimal()
+dev.off()
+
+```
+
+
+

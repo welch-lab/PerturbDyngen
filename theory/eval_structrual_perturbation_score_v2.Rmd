@@ -1,0 +1,2689 @@
+---
+title: "eval_structrual_perturbation_score_v2"
+author: "wzqian"
+date: "2026-02-02"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+library(dyngen)
+library(tidyverse)
+library(ggplot2)
+library(gridExtra)
+library(Matrix)
+library(maotai)
+library(patchwork)
+library(pheatmap)
+library(Matrix)
+library(stringr)
+library(dynutils)
+library(CondIndTests)
+library(anndata)
+library(pcalg)
+library(graph)
+library(patchwork)
+library(furrr)
+library(purrr)
+library(fs)
+library(progressr)
+library(binpackr)
+library(glmnet)
+library(reticulate)
+source("/nfs/turbo/umms-welchjd-code/code/wzqian/Casualformer/theory/theory_simulations_func.R")
+source("/nfs/turbo/umms-welchjd-code/code/wzqian/Casualformer/dyngen/dyngen_my_func.R")
+use_python("~/.cache/R/reticulate/uv/cache/archive-v0/iM9IwoxC8gBZXJ-DWwIoy/bin/python", required = TRUE)
+```
+
+
+score any deg in the descendants, penalize the descendants that are not degs
+
+# data loading
+
+
+```{r}
+models = readRDS("/scratch/sigbio_project_root/sigbio_project25/wzqian/Casual_crispr/dyngen/20250709_branching_kd8/models_all.rds")
+my_exp = readRDS("/nfs/turbo/umms-welchjd-code/code/wzqian/Casualformer/dyngen/20250709_branching_8kd/exp222_N57.rds")
+
+exp_design_hub = readRDS("/nfs/turbo/umms-welchjd-code/code/wzqian/Casualformer/dyngen/20250709_branching_8kd/exp_design_hub.rds")
+
+exp_design = my_exp$experiment_matrix
+colnames(exp_design_hub) = models$WT$feature_info$feature_id
+colnames(exp_design) = models$WT$feature_info$feature_id
+rownames(exp_design_hub) = names(models[60:78])
+rownames(exp_design) = names(models[2:58])
+experiment_results_base = readRDS("/nfs/turbo/umms-welchjd-code/code/wzqian/Casualformer/dyngen/20250709_branching_8kd/experiment_results_800sub.rds")
+experiment_results_hub = readRDS("/nfs/turbo/umms-welchjd-code/code/wzqian/Casualformer/dyngen/20250709_branching_8kd/experiment_results_800sub_hub.rds")
+exp_design = rbind(exp_design,exp_design_hub)
+
+merge_experiment_results <- function(experiment_results_base, experiment_results_hub) {
+  tps <- intersect(names(experiment_results_base), names(experiment_results_hub))
+  if (length(tps) == 0L) stop("No common timepoints between base and hub results.")
+  setNames(
+    lapply(tps, function(tp) {
+      # rows = experiments, cols = genes
+      s_base <- experiment_results_base[[tp]][["stats"]]
+      s_hub  <- experiment_results_hub [[tp]][["stats"]]
+      if (is.null(s_base) || is.null(s_hub)) {
+        stop("Missing $stats at timepoint: ", tp)
+      }
+      s_all <- rbind(s_base, s_hub)
+      list(stats = s_all)
+    }),
+    tps
+  )
+}
+
+experiment_results <- merge_experiment_results(experiment_results_base, experiment_results_hub)
+
+
+set.seed(123)
+model_wt = models$WT
+model_wt <- model_wt %>%generate_experiment_debug()
+sampling_bins <- model_wt$experiment$cell_info %>%
+  group_by(timepoint_group) %>%
+  summarise(
+    NumCells = n(),
+    MinTime = min(sim_time, na.rm = TRUE),
+    MaxTime = max(sim_time, na.rm = TRUE),
+    .groups = "drop"
+  ) %>%
+  arrange(timepoint_group)
+sampling_bins = sampling_bins %>% filter(MinTime > 50)
+
+adj_truth = readRDS("/nfs/turbo/umms-welchjd-code/code/wzqian/Casualformer/dyngen/20250709_branching_8kd/dj_truth.rds")
+tmp = update_adjacency_by_variance(adj_truth, models$WT$simulations$counts, 0.1)
+adj_truth = tmp$updated_adj_matrix
+zero_variance_nodes = tmp$filtered_nodes
+adj_truth[adj_truth == -1] <- 1
+
+```
+
+
+```{r}
+data = readRDS("/nfs/turbo/umms-welchjd-code/code/wzqian/Casualformer/theory/SEM_pred_metrics_test_true_graph.rds")
+random_adj <- readRDS("/nfs/turbo/umms-welchjd-code/code/wzqian/Casualformer/theory/random_graph_better_than_truth.rds")
+```
+
+```{r}
+de_top200 <- readRDS("/nfs/turbo/umms-welchjd-code/code/wzqian/Casualformer/theory/200deg_branching_simu.rds")
+```
+
+```{r}
+obs <- data$obs
+test_exp <- unique(obs$experiment)[59:length(unique(obs$experiment))]
+
+```
+
+
+
+```{r}
+
+de_top200_q50 <- map(de_top200, function(df) {
+
+  # compute 90% quantile of absolute logFC within this table
+  q50 <- quantile(abs(df$logfc), probs = 0.5, na.rm = TRUE)
+
+  df %>%
+    filter(abs(logfc) >= q50) %>%        # keep top 10% effect sizes
+    filter(pval < 0.05) %>%              # significance filter
+    arrange(desc(abs(logfc)))                 # sort by logFC (largest positive first)
+})
+  
+de_top200_q95 <- map(de_top200, function(df) {
+
+  # compute 90% quantile of absolute logFC within this table
+  q95 <- quantile(abs(df$logfc), probs = 0.95, na.rm = TRUE)
+
+  df %>%
+    filter(abs(logfc) >= q95) %>%        # keep top 10% effect sizes
+    filter(pval < 0.05) %>%              # significance filter
+     arrange(desc(abs(logfc)))                 # sort by logFC (largest positive first)
+})
+
+de_top200_q90 <- map(de_top200, function(df) {
+
+  # compute 90% quantile of absolute logFC within this table
+  q90 <- quantile(abs(df$logfc), probs = 0.90, na.rm = TRUE)
+
+  df %>%
+    filter(abs(logfc) >= q90) %>%        # keep top 10% effect sizes
+    filter(pval < 0.05) %>%              # significance filter
+     arrange(desc(abs(logfc)))                 # sort by logFC (largest positive first)
+})
+
+
+de_top200_q85 <- map(de_top200, function(df) {
+
+  # compute 90% quantile of absolute logFC within this table
+  q85 <- quantile(abs(df$logfc), probs = 0.85, na.rm = TRUE)
+
+  df %>%
+    filter(abs(logfc) >= q85) %>%        # keep top 10% effect sizes
+    filter(pval < 0.05) %>%              # significance filter
+    arrange(desc(abs(logfc)))                 # sort by logFC (largest positive first)
+})
+```
+
+
+
+```{r}
+k_hop_descendants <- function(A, targets, k = 1) {
+  A <- as.matrix(A)
+  p <- ncol(A)
+  targets <- unique(targets)
+
+  visited <- rep(FALSE, p)
+  frontier <- targets
+  visited[frontier] <- TRUE
+
+  desc <- integer(0)
+
+  for (step in seq_len(k)) {
+
+    # children of current frontier: edge frontier -> child
+    children <- which(colSums(A[frontier, , drop = FALSE]) > 0)
+    children <- setdiff(children, which(visited))
+
+    if (!length(children)) break
+
+    desc <- c(desc, children)
+    visited[children] <- TRUE
+    frontier <- children
+  }
+
+  unique(desc)
+}
+
+
+all_downstream <- function(A, targets) {
+  A <- as.matrix(A)
+  p <- ncol(A)
+
+  visited <- rep(FALSE, p)
+  stack <- targets
+  visited[stack] <- TRUE
+
+  desc <- integer(0)
+
+  while (length(stack)) {
+
+    children <- which(colSums(A[stack, , drop = FALSE]) > 0)
+    children <- setdiff(children, which(visited))
+
+    if (!length(children)) break
+
+    desc <- c(desc, children)
+    visited[children] <- TRUE
+    stack <- children
+  }
+
+  unique(desc)
+}
+
+
+
+score_downstream <- function(de_list,
+                                      A,
+                                      exp_design,
+                                      step = NULL,     # NULL = all downstream
+                                      top_x = NULL,
+                                      exp_subset = NULL,
+                                      alpha = 0.5 ) {
+
+  genes <- colnames(exp_design)
+  gene_to_idx <- setNames(seq_along(genes), genes)
+
+  exps <- names(de_list)
+  if (!is.null(exp_subset)) {
+    exps <- intersect(exps, exp_subset)
+  }
+
+  res <- data.frame()
+
+  for (e in exps) {
+
+    dt <- de_list[[e]]
+    if (is.null(dt) || !nrow(dt)) next
+
+    if (!is.null(top_x)) {
+      dt <- head(dt, top_x)
+    }
+
+    # top DEGs
+    S_true <- dt$gene
+    S_true_idx <- gene_to_idx[S_true]
+
+    # perturbed nodes
+    pert_genes <- colnames(exp_design)[exp_design[e, ] != 0]
+    pert_idx <- gene_to_idx[pert_genes]
+
+    # downstream set
+    S_down_idx <- if (is.null(step)) {
+      all_downstream(A, pert_idx)
+    } else {
+      k_hop_descendants(A, pert_idx, k = step)
+    }
+
+    # exclude perturbed nodes themselves
+    S_down_idx <- setdiff(S_down_idx, pert_idx)
+    S_down <- genes[S_down_idx]
+
+    # DEGs NOT explained by downstream
+    n_miss <- length(setdiff(S_true, S_down))
+    miss_rate <- if (length(S_true) == 0) NA_real_ else n_miss / length(S_true)
+
+    # Useless downstream (precision penalty)
+    n_noise <- length(setdiff(S_down, S_true))
+    noise_rate <- if (length(S_down) == 0) 0 else n_noise / length(S_down)
+
+
+    neg_score <- alpha * miss_rate + (1 - alpha) * noise_rate
+
+    res <- rbind(
+      res,
+      data.frame(
+      experiment = e,
+      step = ifelse(is.null(step), "all", step),
+      top_x = length(S_true),
+      miss_rate = miss_rate,
+      noise_rate = noise_rate,
+      negative_score = neg_score,
+      stringsAsFactors = FALSE
+    )
+  )
+  }
+
+  res
+}
+
+```
+
+
+
+```{r}
+top_x_vals <- seq(10, 50, by = 10)
+
+neg_scores <- lapply(top_x_vals, function(tx) {
+
+  t_res <- score_downstream(
+    de_top200,
+    adj_truth,
+    exp_design,
+    step = 1,
+    top_x = tx,
+    exp_subset = test_exp
+  ) %>%
+    mutate(group = "Truth")
+
+  r_res <- score_downstream(
+    de_top200,
+    random_adj,
+    exp_design,
+    step = 1,
+    top_x = tx,
+    exp_subset = test_exp
+  ) %>%
+    mutate(group = "Random")
+
+  bind_rows(t_res, r_res)
+}) %>%
+  bind_rows()
+
+summary_stats <- neg_scores %>%
+  group_by(group) %>%
+  summarise(
+    mean_score = mean(negative_score, na.rm = TRUE),
+    median_score = median(negative_score, na.rm = TRUE),
+    .groups = "drop"
+  )
+```
+
+```{r}
+pvals <- neg_scores %>%
+  group_by(top_x) %>%
+  summarise(
+    p_value = {
+      truth_scores  <- negative_score[group == "Truth"]
+      random_scores <- negative_score[group == "Random"]
+
+      if (length(truth_scores) > 0 && length(random_scores) > 0) {
+        wilcox.test(
+          x = truth_scores,
+          y = random_scores,
+          alternative = "less"
+        )$p.value
+      } else {
+        NA_real_
+      }
+    },
+    .groups = "drop"
+  ) %>%
+  mutate(
+    p_label = paste0("p = ", formatC(p_value, format = "f", digits = 3))
+  )
+```
+```{r}
+annot_pos <- neg_scores %>%
+  group_by(top_x) %>%
+  summarise(
+    x = "Random",  # 右侧 box
+    y = min(negative_score, na.rm = TRUE),
+    .groups = "drop"
+  ) %>%
+  left_join(pvals, by = "top_x")
+
+p <- ggplot(
+  neg_scores,
+  aes(x = group, y = negative_score, fill = group)
+) +
+  geom_boxplot(
+    outlier.shape = NA,
+    width = 0.6,
+    alpha = 0.7
+  ) +
+  geom_jitter(
+    width = 0.15,
+    size = 0.8,
+    alpha = 0.4
+  ) +
+  facet_wrap(
+    ~ top_x,
+    nrow = 2,
+    ncol = 3,
+    scales = "free_y",
+    labeller = labeller(top_x = function(x) paste0("Top X = ", x))
+  ) +
+  scale_fill_manual(
+    values = c(
+      "Truth"  = "#1b9e77",
+      "Random" = "#d95f02"
+    )
+  ) +
+  geom_text(
+    data = annot_pos,
+    aes(x = x, y = y, label = p_label),
+    inherit.aes = FALSE,
+    hjust = 1,
+    vjust = -0.3,
+    size = 4
+  ) +
+  theme_bw(base_size = 16) +
+  theme(
+    legend.position = "top",
+    strip.background = element_rect(fill = "grey90"),
+    strip.text = element_text(face = "bold"),
+    axis.title.x = element_blank()
+  ) +
+  ylab("Causal Reach Violation + noise penalty") +
+  ggtitle("Causal Reach Violation\nOne-sided Wilcoxon: Truth < Random")
+
+print(p)
+```
+```{r}
+png("/nfs/turbo/umms-welchjd-code/code/wzqian/Casualformer/dyngen/20250709_branching_8kd/figures/CRVnoise_true_vs_random_top10_50_no_filter_step1.png", heigh = 4000, width = 6000,res = 300)
+print(p)
+dev.off()
+
+```
+
+```{r}
+top_x_vals <- seq(10, 30, by = 10)
+
+neg_scores <- lapply(top_x_vals, function(tx) {
+
+  t_res <- score_downstream(
+    de_top200_q50,
+    adj_truth,
+    exp_design,
+    step = 1,
+    top_x = tx,
+    exp_subset = test_exp
+  ) %>%
+    mutate(group = "Truth")
+
+  r_res <- score_downstream(
+    de_top200_q50,
+    random_adj,
+    exp_design,
+    step = 1,
+    top_x = tx,
+    exp_subset = test_exp
+  ) %>%
+    mutate(group = "Random")
+
+  bind_rows(t_res, r_res)
+}) %>%
+  bind_rows()
+
+summary_stats <- neg_scores %>%
+  group_by(group) %>%
+  summarise(
+    mean_score = mean(negative_score, na.rm = TRUE),
+    median_score = median(negative_score, na.rm = TRUE),
+    .groups = "drop"
+  )
+
+pvals <- neg_scores %>%
+  group_by(top_x) %>%
+  summarise(
+    p_value = {
+      truth_scores  <- negative_score[group == "Truth"]
+      random_scores <- negative_score[group == "Random"]
+
+      if (length(truth_scores) > 0 && length(random_scores) > 0) {
+        wilcox.test(
+          x = truth_scores,
+          y = random_scores,
+          alternative = "less"
+        )$p.value
+      } else {
+        NA_real_
+      }
+    },
+    .groups = "drop"
+  ) %>%
+  mutate(
+    p_label = paste0("p = ", formatC(p_value, format = "f", digits = 3))
+  )
+
+annot_pos <- neg_scores %>%
+  group_by(top_x) %>%
+  summarise(
+    x = "Random",  # 右侧 box
+    y = min(negative_score, na.rm = TRUE),
+    .groups = "drop"
+  ) %>%
+  left_join(pvals, by = "top_x")
+
+p <- ggplot(
+  neg_scores,
+  aes(x = group, y = negative_score, fill = group)
+) +
+  geom_boxplot(
+    outlier.shape = NA,
+    width = 0.6,
+    alpha = 0.7
+  ) +
+  geom_jitter(
+    width = 0.15,
+    size = 0.8,
+    alpha = 0.4
+  ) +
+  facet_wrap(
+    ~ top_x,
+    nrow = 2,
+    ncol = 3,
+    scales = "free_y",
+    labeller = labeller(top_x = function(x) paste0("Top X = ", x))
+  ) +
+  scale_fill_manual(
+    values = c(
+      "Truth"  = "#1b9e77",
+      "Random" = "#d95f02"
+    )
+  ) +
+  geom_text(
+    data = annot_pos,
+    aes(x = x, y = y, label = p_label),
+    inherit.aes = FALSE,
+    hjust = 1,
+    vjust = -0.3,
+    size = 4
+  ) +
+  theme_bw(base_size = 16) +
+  theme(
+    legend.position = "top",
+    strip.background = element_rect(fill = "grey90"),
+    strip.text = element_text(face = "bold"),
+    axis.title.x = element_blank()
+  ) +
+  ylab(" penalized Causal Reach Violation") +
+  ggtitle("Causal Reach Violation with normalzied noise penalty\nOne-sided Wilcoxon: Truth < Random")
+
+print(p)
+```
+
+```{r}
+png("/nfs/turbo/umms-welchjd-code/code/wzqian/Casualformer/dyngen/20250709_branching_8kd/figures/CRVnoise_true_vs_random_top10_30_q50_step1.png", heigh = 4000, width = 6000,res = 300)
+print(p)
+dev.off()
+
+```
+
+
+#####################################################################################
+
+
+```{r}
+make_partial_graph <- function(adj_truth, correct_frac, seed = NULL) {
+  if (!is.null(seed)) set.seed(seed)
+
+  A <- adj_truth
+  p <- nrow(A)
+
+  # 所有可能的有向边（不含自环）
+  all_edges <- which(row(A) != col(A), arr.ind = TRUE)
+
+  # True edges
+  true_edges <- which(A == 1, arr.ind = TRUE)
+  E <- nrow(true_edges)
+
+  # False edges = 非真实边
+  false_edges <- all_edges[!apply(all_edges, 1, function(x)
+    any(x[1] == true_edges[, 1] & x[2] == true_edges[, 2])
+  ), , drop = FALSE]
+
+  n_keep <- round(correct_frac * E)
+  n_flip <- E - n_keep
+
+  keep_idx <- sample(seq_len(E), n_keep)
+  keep_edges <- true_edges[keep_idx, , drop = FALSE]
+
+  new_edges <- false_edges[sample(seq_len(nrow(false_edges)), n_flip), , drop = FALSE]
+
+  # build new adjacency
+  A_new <- matrix(0, p, p)
+  A_new[keep_edges] <- 1
+  A_new[new_edges] <- 1
+
+  A_new
+}
+```
+
+
+```{r}
+correct_low  <- c(0.20, 0.40, 0.60, 0.80)
+correct_high <- c(0.90, 0.93, 0.96)
+
+top_x_vals <- seq(10, 30, by = 10)
+
+partial_graphs_low <- lapply(correct_low, function(frac)
+  make_partial_graph(adj_truth, frac, seed = 1)
+)
+names(partial_graphs_low) <- paste0(correct_low * 100, "%")
+
+partial_graphs_high <- lapply(correct_high, function(frac)
+  make_partial_graph(adj_truth, frac, seed = 1)
+)
+names(partial_graphs_high) <- paste0(correct_high * 100, "%")
+
+```
+
+
+
+
+
+
+
+```{r}
+calc_scores_for_graphs <- function(graph_list,
+                                   de_list,
+                                   exp_design,
+                                   top_x_vals,
+                                   exp_subset = NULL,
+                                   step = NULL,
+                                   graph_group = NULL) {
+  # graph_list: named list of adjacency matrices
+  # de_list: list of DE tables by experiment
+  # exp_design: design matrix (rows=experiments, cols=genes)
+  # top_x_vals: vector, e.g. seq(10, 50, by = 10)
+  # exp_subset: optional vector of experiment names
+  # step: NULL means all upstream (as in your score_negative_upstream)
+  # graph_group: optional label for grouping, e.g. "low"/"high"
+
+  dplyr::bind_rows(lapply(names(graph_list), function(name) {
+    A <- graph_list[[name]]
+
+    dplyr::bind_rows(lapply(top_x_vals, function(tx) {
+      score_downstream(
+        de_list   = de_list,
+        A         = A,
+        exp_design = exp_design,
+        step      = step,
+        top_x     = tx,
+        exp_subset = exp_subset
+      ) %>%
+        dplyr::mutate(
+          graph = name,
+          graph_group = graph_group,
+          top_x = tx
+        )
+    }))
+  }))
+}
+```
+
+
+```{r}
+top_x_vals <- seq(10, 30, by = 10)
+
+scores_low <- calc_scores_for_graphs(
+  graph_list  = partial_graphs_low,
+  de_list     = de_top200_q50,
+  exp_design  = exp_design,
+  top_x_vals  = top_x_vals,
+  exp_subset  = test_exp,
+  step        = 1,
+  graph_group = "low"
+)
+
+scores_high <- calc_scores_for_graphs(
+  graph_list  = partial_graphs_high,
+  de_list     = de_top200_q50,
+  exp_design  = exp_design,
+  top_x_vals  = top_x_vals,
+  exp_subset  = test_exp,
+  step        = 1,
+  graph_group = "high"
+)
+scores_truth <- lapply(top_x_vals, function(tx) {
+  score_downstream(
+    de_top200_q50,
+    adj_truth,
+    exp_design,
+    step = 1,
+    top_x = tx,
+    exp_subset = test_exp
+  ) %>%
+    dplyr::mutate(
+      graph = "Truth",
+      top_x = tx
+    )
+}) %>% dplyr::bind_rows()
+```
+
+
+
+```{r}
+partial_scores <- scores_low %>%
+  dplyr::rename(partial = graph)
+wide_low <- partial_scores %>%
+  dplyr::left_join(
+    scores_truth %>%
+      dplyr::select(experiment, top_x, Truth = negative_score),
+    by = c("experiment", "top_x")
+  ) %>%
+  dplyr::rename(Partial = negative_score)
+
+
+```
+
+```{r}
+pvals_low <- wide_low %>%
+  dplyr::filter(!is.na(Truth), !is.na(Partial)) %>%
+  dplyr::group_by(top_x, partial) %>%
+  dplyr::summarise(
+    p_value = wilcox.test(
+      x = Truth,
+      y = Partial,
+      paired = TRUE,
+      alternative = "less"
+    )$p.value,
+    .groups = "drop"
+  ) %>%
+  dplyr::mutate(
+    p_label = paste0("p = ", formatC(p_value, format = "f", digits = 3))
+  )
+```
+
+
+
+
+
+```{r}
+truth_expanded <- scores_truth %>%
+  dplyr::select(-graph) %>%                      # remove old "graph" to avoid name conflict
+  tidyr::crossing(
+    graph = unique(scores_low$graph)             # "20%" "40%" "60%" "80%"
+  ) %>%
+  dplyr::mutate(group = "Truth")
+
+# --- 2) Partial scores ---
+partial_plot <- scores_low %>%
+  dplyr::mutate(group = "Partial")
+
+# --- 3) Combine for plotting ---
+scores_low_plot <- dplyr::bind_rows(
+  truth_expanded,
+  partial_plot
+) %>%
+  dplyr::mutate(
+    group = factor(group, levels = c("Truth", "Partial")),
+    top_x = factor(top_x, levels = top_x_vals),
+    graph = factor(graph, levels = unique(scores_low$graph))  # keep column order stable
+  )
+
+# --- 4) p-value annotation (bottom-right of each panel) ---
+pvals_low_annot <- pvals_low %>%
+  dplyr::mutate(
+    top_x = factor(top_x, levels = top_x_vals),
+    graph = factor(partial, levels = levels(scores_low_plot$graph)),
+    x = "Partial",
+    y = 0
+  )
+
+# --- 5) Plot: 5 (top_x) × 4 (partial%) panels, each panel has 2 groups ---
+p_low <- ggplot(
+  scores_low_plot,
+  aes(x = group, y = negative_score, fill = group)
+) +
+  geom_boxplot(
+    outlier.shape = NA,
+    width = 0.6,
+    alpha = 0.7
+  ) +
+  geom_jitter(
+    width = 0.15,
+    size = 0.7,
+    alpha = 0.4
+  ) +
+  facet_grid(
+    top_x ~ graph,
+    scales = "fixed"
+  ) +
+  scale_fill_manual(
+    values = c(
+      "Truth"   = "#1b9e77",
+      "Partial" = "#d95f02"
+    )
+  ) +
+  coord_cartesian(ylim = c(0, 1)) +
+  geom_text(
+    data = pvals_low_annot,
+    aes(x = x, y = y, label = p_label),
+    inherit.aes = FALSE,
+    hjust = 1.05,
+    vjust = -0.2,
+    size = 3.5
+  ) +
+  theme_bw(base_size = 15) +
+  theme(
+    legend.position = "top",
+    strip.background = element_rect(fill = "grey90"),
+    strip.text = element_text(face = "bold"),
+    axis.title.x = element_blank()
+  ) +
+  ylab("Causal Reach Violation") +
+  ggtitle("Truth vs Partial-correct graphs (20–80%)\nPaired Wilcoxon (per panel): Truth < Partial")
+
+print(p_low)
+```
+
+```{r}
+png("/nfs/turbo/umms-welchjd-code/code/wzqian/Casualformer/dyngen/20250709_branching_8kd/figures/CRVnoise_true_vs_partial_low_top10_30_q50_step1.png", heigh = 4000, width = 6000,res = 300)
+print(p_low)
+dev.off()
+
+```
+
+
+
+# for high version
+
+```{r}
+partial_scores <- scores_high %>%
+  dplyr::rename(partial = graph)
+wide_high <- partial_scores %>%
+  dplyr::left_join(
+    scores_truth %>%
+      dplyr::select(experiment, top_x, Truth = negative_score),
+    by = c("experiment", "top_x")
+  ) %>%
+  dplyr::rename(Partial = negative_score)
+
+
+```
+
+
+```{r}
+pvals_high <- wide_high %>%
+  dplyr::filter(!is.na(Truth), !is.na(Partial)) %>%
+  dplyr::group_by(top_x, partial) %>%
+  dplyr::summarise(
+    p_value = wilcox.test(
+      x = Truth,
+      y = Partial,
+      paired = TRUE,
+      alternative = "less"
+    )$p.value,
+    .groups = "drop"
+  ) %>%
+  dplyr::mutate(
+    p_label = paste0("p = ", formatC(p_value, format = "f", digits = 3))
+  )
+```
+
+
+```{r}
+truth_expanded <- scores_truth %>%
+  dplyr::select(-graph) %>%                      # remove old "graph" to avoid name conflict
+  tidyr::crossing(
+    graph = unique(scores_high$graph)             # "20%" "40%" "60%" "80%"
+  ) %>%
+  dplyr::mutate(group = "Truth")
+
+# --- 2) Partial scores ---
+partial_plot_h <- scores_high %>%
+  dplyr::mutate(group = "Partial")
+
+# --- 3) Combine for plotting ---
+scores_high_plot <- dplyr::bind_rows(
+  truth_expanded,
+  partial_plot_h
+) %>%
+  dplyr::mutate(
+    group = factor(group, levels = c("Truth", "Partial")),
+    top_x = factor(top_x, levels = top_x_vals),
+    graph = factor(graph, levels = unique(scores_high$graph))  # keep column order stable
+  )
+
+# --- 4) p-value annotation (bottom-right of each panel) ---
+pvals_high_annot <- pvals_high %>%
+  dplyr::mutate(
+    top_x = factor(top_x, levels = top_x_vals),
+    graph = factor(partial, levels = levels(scores_high_plot$graph)),
+    x = "Partial",
+    y = 0
+  )
+
+# --- 5) Plot: 5 (top_x) × 4 (partial%) panels, each panel has 2 groups ---
+p_high <- ggplot(
+  scores_high_plot,
+  aes(x = group, y = negative_score, fill = group)
+) +
+  geom_boxplot(
+    outlier.shape = NA,
+    width = 0.6,
+    alpha = 0.7
+  ) +
+  geom_jitter(
+    width = 0.15,
+    size = 0.7,
+    alpha = 0.4
+  ) +
+  facet_grid(
+    top_x ~ graph,
+    scales = "fixed"
+  ) +
+  scale_fill_manual(
+    values = c(
+      "Truth"   = "#1b9e77",
+      "Partial" = "#d95f02"
+    )
+  ) +
+  coord_cartesian(ylim = c(0, 1)) +
+  geom_text(
+    data = pvals_high_annot,
+    aes(x = x, y = y, label = p_label),
+    inherit.aes = FALSE,
+    hjust = 1.05,
+    vjust = -0.2,
+    size = 3.5
+  ) +
+  theme_bw(base_size = 15) +
+  theme(
+    legend.position = "top",
+    strip.background = element_rect(fill = "grey90"),
+    strip.text = element_text(face = "bold"),
+    axis.title.x = element_blank()
+  ) +
+  ylab("Causal Reach Violation") +
+  ggtitle("Truth vs Partial-correct graphs (90-93%)\nPaired Wilcoxon (per panel): Truth < Partial")
+
+print(p_high)
+```
+```{r}
+png("/nfs/turbo/umms-welchjd-code/code/wzqian/Casualformer/dyngen/20250709_branching_8kd/figures/CRVnoise_true_vs_partial_hight_top10_30_q50_step1.png", heigh = 4000, width = 6000,res = 300)
+print(p_high)
+dev.off()
+
+```
+
+#sensitvity test
+
+```{r}
+correct_fracs <- seq(0.01, 1, by = 0.05)
+n_rep <- 10
+step_vals <- c(1, 2, 3)
+tx_vals <- c(10, 20, 30)
+
+results <- list()
+
+for (cf in correct_fracs) {
+  for (r in seq_len(n_rep)) {
+
+    A_part <- make_partial_graph(adj_truth, cf, seed = r)
+
+    for (st in step_vals) {
+      for (tx in tx_vals) {
+
+        sc <- score_downstream(
+          de_top200_q50,
+          A_part,
+          exp_design,
+          step = st,
+          top_x = tx,
+          exp_subset = test_exp
+        )
+
+        results[[length(results) + 1]] <- sc %>%
+          mutate(
+            correct_frac = cf,
+            rep = r,
+            step = st,
+            top_x = tx
+          )
+      }
+    }
+  }
+}
+
+sens_df <- bind_rows(results)
+
+```
+
+```{r}
+
+
+p <- ggplot(sens_df, aes(correct_frac, negative_score)) +
+  geom_point(alpha = 0.3) +
+  geom_smooth(se = TRUE) +
+  facet_grid(step ~ top_x) +
+    theme_bw(base_size = 15) +
+  theme(
+    legend.position = "top",
+    strip.background = element_rect(fill = "grey90"),
+    strip.text = element_text(face = "bold"),
+    axis.title.x = element_blank()
+  ) +
+  ylab("Penalized Causal Reach Violation") 
+
+print(p)
+
+```
+```{r}
+png("/nfs/turbo/umms-welchjd-code/code/wzqian/Casualformer/dyngen/20250709_branching_8kd/figures/CRVnoise_sensitvity_sweep.png", heigh = 4000, width = 6000,res = 300)
+print(p)
+dev.off()
+
+```
+
+
+```{r}
+sens_df$correct_frac_f <- factor(
+  sens_df$correct_frac,
+  levels = sort(unique(sens_df$correct_frac))
+)
+
+p <- ggplot(
+  sens_df,
+  aes(x = correct_frac_f, y = negative_score)
+) +
+  geom_boxplot(
+    outlier.shape = NA,
+    width = 0.7,
+    alpha = 0.75
+  ) +
+  geom_jitter(
+    width = 0.15,
+    size = 0.6,
+    alpha = 0.35
+  ) +
+  facet_grid(step ~ top_x) +
+  theme(
+    legend.position = "top",
+    strip.background = element_rect(fill = "grey90"),
+    strip.text = element_text(face = "bold"),
+    axis.text.x = element_text(angle = 45, hjust = 1),
+    axis.title.x = element_blank()
+  ) +
+  ylab("Penalized Causal Reach Violation") +
+  xlab("Fraction of correct edges")
+
+print(p)
+```
+```{r}
+png("/nfs/turbo/umms-welchjd-code/code/wzqian/Casualformer/dyngen/20250709_branching_8kd/figures/CRVnoise_sensitvity_sweepbox.png", heigh = 4000, width = 6000,res = 300)
+print(p)
+dev.off()
+
+```
+
+
+```{r}
+ box_stats <- sens_df %>%
+  group_by(step, top_x, correct_frac) %>%
+  summarise(
+    mean_score   = mean(negative_score, na.rm = TRUE),
+    median_score = median(negative_score, na.rm = TRUE),
+    max_score    = max(negative_score, na.rm = TRUE),
+    min_score    = min(negative_score, na.rm = TRUE),
+    .groups = "drop"
+  ) %>%
+  arrange(step, top_x, correct_frac)
+```
+
+```{r}
+box_deltas <- box_stats %>%
+  group_by(step, top_x) %>%
+  mutate(
+    mean_delta   = mean_score   - lag(mean_score),
+    median_delta = median_score - lag(median_score),
+    max_delta    = max_score    - lag(max_score),
+    min_delta    = min_score    - lag(min_score),
+    x_frac = correct_frac
+  ) %>%
+  filter(!is.na(mean_delta)) %>%
+  ungroup()
+```
+
+```{r}
+central_long <- box_deltas %>%
+  pivot_longer(
+    cols = c(mean_delta, median_delta),
+    names_to = "stat",
+    values_to = "delta"
+  )
+
+p1 <- ggplot(central_long, aes(x = x_frac, y = delta, color = stat)) +
+  geom_line(linewidth = 1.1) +
+  geom_point(size = 1.8) +
+  facet_grid(step ~ top_x) +
+  theme_bw(base_size = 15) +
+  theme(
+    legend.position = "top",
+    strip.background = element_rect(fill = "grey90"),
+    strip.text = element_text(face = "bold")
+  ) +
+  xlab("Larger edge-correctness fraction") +
+  ylab("Δ summary statistic") +
+  ggtitle("Consecutive edge-correctness differences: mean & median")
+
+print(p1)
+```
+```{r}
+png("/nfs/turbo/umms-welchjd-code/code/wzqian/Casualformer/dyngen/20250709_branching_8kd/figures/CRVnoise_sensitvity_sweep_mean_median_diff.png", heigh = 4000, width = 6000,res = 300)
+print(p1)
+dev.off()
+
+```
+
+
+
+```{r}
+extreme_long <- box_deltas %>%
+  pivot_longer(
+    cols = c(max_delta, min_delta),
+    names_to = "stat",
+    values_to = "delta"
+  )
+
+p2 <- ggplot(extreme_long, aes(x = x_frac, y = delta, color = stat)) +
+  geom_line(linewidth = 1.1) +
+  geom_point(size = 1.8) +
+  facet_grid(step ~ top_x) +
+  theme_bw(base_size = 15) +
+  theme(
+    legend.position = "top",
+    strip.background = element_rect(fill = "grey90"),
+    strip.text = element_text(face = "bold")
+  ) +
+  xlab("Larger edge-correctness fraction") +
+  ylab("Δ summary statistic") +
+  ggtitle("Consecutive edge-correctness : max & min")
+
+print(p2)
+```
+
+```{r}
+png("/nfs/turbo/umms-welchjd-code/code/wzqian/Casualformer/dyngen/20250709_branching_8kd/figures/CRVnoise_sensitvity_sweep_minmax_diff.png", heigh = 4000, width = 6000,res = 300)
+print(p2)
+dev.off()
+
+```
+
+
+#############################################################################
+# 
+AdjScore=Violation−E[Violationrandom​]
+
+```{r}
+
+sample_random_graph_same_edges <- function(A,
+                                           allow_self_loops = FALSE) {
+  A <- as.matrix(A)
+  p <- nrow(A)
+  stopifnot(ncol(A) == p)
+  
+  # 原图边数
+  m <- sum(A != 0)
+  
+  # 所有候选边位置 (i != j)，不允许自环
+  if (!allow_self_loops) {
+    cand <- which(row(A) != col(A), arr.ind = TRUE)
+  } else {
+    cand <- which(matrix(TRUE, nrow = p, ncol = p), arr.ind = TRUE)
+  }
+  
+  n_cand <- nrow(cand)
+  if (m > n_cand) {
+    stop("Number of edges in input graph exceeds possible edges under current constraints.")
+  }
+  
+
+  sel_idx <- sample(seq_len(n_cand), size = m, replace = FALSE)
+  sel_edges <- cand[sel_idx, , drop = FALSE]
+  
+
+  A_rand <- matrix(0L, nrow = p, ncol = p)
+  A_rand[as.matrix(sel_edges)] <- 1L
+  
+
+  diag(A_rand) <- 0L
+  rownames(A_rand) <-rownames(A)
+  colnames(A_rand) <- colnames(A)
+  
+  A_rand
+}
+
+
+
+compute_violation_one_graph <- function(A,
+                                        de_list,
+                                        exp_design,
+                                        step = NULL,
+                                        top_x = NULL,
+                                        exp_subset = NULL) {
+
+  genes <- colnames(exp_design)
+  gene_to_idx <- setNames(seq_along(genes), genes)
+
+  exps <- names(de_list)
+  if (!is.null(exp_subset)) {
+    exps <- intersect(exps, exp_subset)
+  }
+
+  vals <- numeric(0)
+
+  for (e in exps) {
+
+    dt <- de_list[[e]]
+    if (is.null(dt) || !nrow(dt)) next
+
+    if (!is.null(top_x)) {
+      dt <- head(dt, top_x)
+    }
+
+    S_true <- dt$gene
+    S_true_idx <- gene_to_idx[S_true]
+
+    pert_genes <- colnames(exp_design)[exp_design[e, ] != 0]
+    pert_idx <- gene_to_idx[pert_genes]
+
+    S_down_idx <- if (is.null(step)) {
+      all_downstream(A, pert_idx)
+    } else {
+      k_hop_descendants(A, pert_idx, k = step)
+    }
+
+    S_down_idx <- setdiff(S_down_idx, pert_idx)
+    S_down <- genes[S_down_idx]
+
+    n_miss <- length(setdiff(S_true, S_down))
+    viol <- if (length(S_true) == 0) NA_real_ else n_miss / length(S_true)
+
+    vals <- c(vals, viol)
+  }
+
+  mean(vals, na.rm = TRUE)
+}
+
+
+ompute_random_baseline <- function(A,
+                                    de_list,
+                                    exp_design,
+                                    step = NULL,
+                                    top_x = NULL,
+                                    exp_subset = NULL,
+                                    n_random = 100) {
+
+  v_rand <- numeric(n_random)
+
+  for (i in seq_len(n_random)) {
+
+    A_rand <- sample_random_graph_same_edges(A)
+
+    v_rand[i] <- compute_violation_one_graph(
+      A_rand,
+      de_list,
+      exp_design,
+      step = step,
+      top_x = top_x,
+      exp_subset = exp_subset
+    )
+  }
+
+  list(
+    mean = mean(v_rand, na.rm = TRUE),
+    sd   = sd(v_rand, na.rm = TRUE),
+    all  = v_rand
+  )
+}
+
+compute_adjusted_score <- function(A,
+                                   de_list,
+                                   exp_design,
+                                   step = NULL,
+                                   top_x = NULL,
+                                   exp_subset = NULL,
+                                   n_random = 100) {
+
+  v_real <- compute_violation_one_graph(
+    A,
+    de_list,
+    exp_design,
+    step = step,
+    top_x = top_x,
+    exp_subset = exp_subset
+  )
+
+  rand_stats <- compute_random_baseline(
+    A,
+    de_list,
+    exp_design,
+    step = step,
+    top_x = top_x,
+    exp_subset = exp_subset,
+    n_random = n_random
+  )
+
+  adj <- v_real - rand_stats$mean
+
+  data.frame(
+    violation_real = v_real,
+    violation_random_mean = rand_stats$mean,
+    violation_random_sd = rand_stats$sd,
+    adjusted_score = adj
+  )
+}
+
+
+
+score_downstream_adjusted <- function(de_list,
+                                      A,
+                                      exp_design,
+                                      step = NULL,
+                                      top_x = NULL,
+                                      exp_subset = NULL,
+                                      n_random = 100) {
+
+  genes <- colnames(exp_design)
+  gene_to_idx <- setNames(seq_along(genes), genes)
+
+  exps <- names(de_list)
+  if (!is.null(exp_subset)) {
+    exps <- intersect(exps, exp_subset)
+  }
+
+  res <- data.frame()
+
+  for (e in exps) {
+
+    dt <- de_list[[e]]
+    if (is.null(dt) || !nrow(dt)) next
+
+    if (!is.null(top_x)) {
+      dt <- head(dt, top_x)
+    }
+
+    S_true <- dt$gene
+    S_true_idx <- gene_to_idx[S_true]
+
+    pert_genes <- colnames(exp_design)[exp_design[e, ] != 0]
+    pert_idx <- gene_to_idx[pert_genes]
+
+    get_down <- function(A_mat) {
+      idx <- if (is.null(step)) {
+        all_downstream(A_mat, pert_idx)
+      } else {
+        k_hop_descendants(A_mat, pert_idx, k = step)
+      }
+      genes[setdiff(idx, pert_idx)]
+    }
+
+    ## real violation
+    S_down_real <- get_down(A)
+    n_miss_real <- length(setdiff(S_true, S_down_real))
+    viol_real <- if (length(S_true) == 0) NA_real_ else n_miss_real / length(S_true)
+
+    ## random baseline
+    viol_rand <- numeric(n_random)
+
+    for (i in seq_len(n_random)) {
+
+      A_rand <- sample_random_graph_same_edges(A)
+
+      S_down_rand <- get_down(A_rand)
+      n_miss_rand <- length(setdiff(S_true, S_down_rand))
+
+      viol_rand[i] <- if (length(S_true) == 0) NA_real_ else n_miss_rand / length(S_true)
+    }
+
+    viol_rand_mean <- mean(viol_rand, na.rm = TRUE)
+
+    adj_score <- viol_real - viol_rand_mean
+
+    res <- rbind(
+      res,
+      data.frame(
+        experiment = e,
+        step = ifelse(is.null(step), "all", step),
+        top_x = length(S_true),
+        violation_real = viol_real,
+        violation_random_mean = viol_rand_mean,
+        negative_score = adj_score,
+        stringsAsFactors = FALSE
+      )
+    )
+  }
+
+  res
+}
+```
+
+
+```{r}
+top_x_vals <- seq(10, 30, by = 10)
+
+neg_scores <- lapply(top_x_vals, function(tx) {
+
+  t_res <- score_downstream_adjusted(
+    de_top200_q50,
+    adj_truth,
+    exp_design,
+    step = 1,
+    top_x = tx,
+    exp_subset = test_exp,
+    n_random = 100
+  ) %>%
+    mutate(group = "Truth")
+
+  r_res <- score_downstream_adjusted(
+    de_top200_q50,
+    random_adj,
+    exp_design,
+    step = 1,
+    top_x = tx,
+    exp_subset = test_exp,
+    n_random = 100
+  ) %>%
+    mutate(group = "Random")
+
+  bind_rows(t_res, r_res)
+}) %>%
+  bind_rows()
+```
+
+
+```{r}
+summary_stats <- neg_scores %>%
+  group_by(group) %>%
+  summarise(
+    mean_score = mean(negative_score, na.rm = TRUE),
+    median_score = median(negative_score, na.rm = TRUE),
+    .groups = "drop"
+  )
+
+pvals <- neg_scores %>%
+  group_by(top_x) %>%
+  summarise(
+    p_value = {
+      truth_scores  <- negative_score[group == "Truth"]
+      random_scores <- negative_score[group == "Random"]
+
+      if (length(truth_scores) > 0 && length(random_scores) > 0) {
+        wilcox.test(
+          x = truth_scores,
+          y = random_scores,
+          alternative = "less"
+        )$p.value
+      } else {
+        NA_real_
+      }
+    },
+    .groups = "drop"
+  ) %>%
+  mutate(
+    p_label = paste0("p = ", formatC(p_value, format = "f", digits = 3))
+  )
+
+annot_pos <- neg_scores %>%
+  group_by(top_x) %>%
+  summarise(
+    x = "Random",  # 右侧 box
+    y = min(negative_score, na.rm = TRUE),
+    .groups = "drop"
+  ) %>%
+  left_join(pvals, by = "top_x")
+
+p <- ggplot(
+  neg_scores,
+  aes(x = group, y = negative_score, fill = group)
+) +
+  geom_boxplot(
+    outlier.shape = NA,
+    width = 0.6,
+    alpha = 0.7
+  ) +
+  geom_jitter(
+    width = 0.15,
+    size = 0.8,
+    alpha = 0.4
+  ) +
+  facet_wrap(
+    ~ top_x,
+    nrow = 2,
+    ncol = 3,
+    scales = "free_y",
+    labeller = labeller(top_x = function(x) paste0("Top X = ", x))
+  ) +
+  scale_fill_manual(
+    values = c(
+      "Truth"  = "#1b9e77",
+      "Random" = "#d95f02"
+    )
+  ) +
+  geom_text(
+    data = annot_pos,
+    aes(x = x, y = y, label = p_label),
+    inherit.aes = FALSE,
+    hjust = 1,
+    vjust = -0.3,
+    size = 4
+  ) +
+  theme_bw(base_size = 16) +
+  theme(
+    legend.position = "top",
+    strip.background = element_rect(fill = "grey90"),
+    strip.text = element_text(face = "bold"),
+    axis.title.x = element_blank()
+  ) +
+  ylab("Adjusted causal reach violation") +
+  ggtitle("Adjusted Causal Reach Violation\nOne-sided Wilcoxon: Truth < Random")
+
+print(p)
+```
+
+```{r}
+png("/nfs/turbo/umms-welchjd-code/code/wzqian/Casualformer/dyngen/20250709_branching_8kd/figures/CRVadj_true_vs_random_top10_30_q50_step1.png", heigh = 4000, width = 6000,res = 300)
+print(p)
+dev.off()
+
+```
+
+
+
+
+
+
+```{r}
+top_x_vals <- seq(10, 30, by = 10)
+
+neg_scores <- lapply(top_x_vals, function(tx) {
+
+  t_res <- score_downstream_adjusted(
+    de_top200_q50,
+    adj_truth,
+    exp_design,
+    step = 1,
+    top_x = tx,
+    exp_subset = rownames(exp_design),
+    n_random = 100
+  ) %>%
+    mutate(group = "Truth")
+
+  r_res <- score_downstream_adjusted(
+    de_top200_q50,
+    random_adj,
+    exp_design,
+    step = 1,
+    top_x = tx,
+    exp_subset = rownames(exp_design),
+    n_random = 100
+  ) %>%
+    mutate(group = "Random")
+
+  bind_rows(t_res, r_res)
+}) %>%
+  bind_rows()
+
+summary_stats <- neg_scores %>%
+  group_by(group) %>%
+  summarise(
+    mean_score = mean(negative_score, na.rm = TRUE),
+    median_score = median(negative_score, na.rm = TRUE),
+    .groups = "drop"
+  )
+
+pvals <- neg_scores %>%
+  group_by(top_x) %>%
+  summarise(
+    p_value = {
+      truth_scores  <- negative_score[group == "Truth"]
+      random_scores <- negative_score[group == "Random"]
+
+      if (length(truth_scores) > 0 && length(random_scores) > 0) {
+        wilcox.test(
+          x = truth_scores,
+          y = random_scores,
+          alternative = "less"
+        )$p.value
+      } else {
+        NA_real_
+      }
+    },
+    .groups = "drop"
+  ) %>%
+  mutate(
+    p_label = paste0("p = ", formatC(p_value, format = "f", digits = 3))
+  )
+
+annot_pos <- neg_scores %>%
+  group_by(top_x) %>%
+  summarise(
+    x = "Random",  # 右侧 box
+    y = min(negative_score, na.rm = TRUE),
+    .groups = "drop"
+  ) %>%
+  left_join(pvals, by = "top_x")
+
+p <- ggplot(
+  neg_scores,
+  aes(x = group, y = negative_score, fill = group)
+) +
+  geom_boxplot(
+    outlier.shape = NA,
+    width = 0.6,
+    alpha = 0.7
+  ) +
+  geom_jitter(
+    width = 0.15,
+    size = 0.8,
+    alpha = 0.4
+  ) +
+  facet_wrap(
+    ~ top_x,
+    nrow = 2,
+    ncol = 3,
+    scales = "free_y",
+    labeller = labeller(top_x = function(x) paste0("Top X = ", x))
+  ) +
+  scale_fill_manual(
+    values = c(
+      "Truth"  = "#1b9e77",
+      "Random" = "#d95f02"
+    )
+  ) +
+  geom_text(
+    data = annot_pos,
+    aes(x = x, y = y, label = p_label),
+    inherit.aes = FALSE,
+    hjust = 1,
+    vjust = -0.3,
+    size = 4
+  ) +
+  theme_bw(base_size = 16) +
+  theme(
+    legend.position = "top",
+    strip.background = element_rect(fill = "grey90"),
+    strip.text = element_text(face = "bold"),
+    axis.title.x = element_blank()
+  ) +
+  ylab("Adjusted causal reach violation") +
+  ggtitle("Adjusted Causal Reach Violation\nOne-sided Wilcoxon: Truth < Random")
+
+print(p)
+```
+
+```{r}
+png("/nfs/turbo/umms-welchjd-code/code/wzqian/Casualformer/dyngen/20250709_branching_8kd/figures/CRVadj_true_vs_random_top10_30_q50_step1_all_exp.png", heigh = 4000, width = 6000,res = 300)
+print(p)
+dev.off()
+
+```
+
+
+
+# try direct low-value penalty
+
+
+```{r}
+
+k_hop_descendants <- function(A, targets, k = 1) {
+  A <- as.matrix(A)
+  p <- ncol(A)
+  targets <- unique(targets)
+
+  visited <- rep(FALSE, p)
+  frontier <- targets
+  visited[frontier] <- TRUE
+
+  desc <- integer(0)
+
+  for (step in seq_len(k)) {
+
+    # children of current frontier: edge frontier -> child
+    children <- which(colSums(A[frontier, , drop = FALSE]) > 0)
+    children <- setdiff(children, which(visited))
+
+    if (!length(children)) break
+
+    desc <- c(desc, children)
+    visited[children] <- TRUE
+    frontier <- children
+  }
+
+  unique(desc)
+}
+
+
+all_downstream <- function(A, targets) {
+  A <- as.matrix(A)
+  p <- ncol(A)
+
+  visited <- rep(FALSE, p)
+  stack <- targets
+  visited[stack] <- TRUE
+
+  desc <- integer(0)
+
+  while (length(stack)) {
+
+    children <- which(colSums(A[stack, , drop = FALSE]) > 0)
+    children <- setdiff(children, which(visited))
+
+    if (!length(children)) break
+
+    desc <- c(desc, children)
+    visited[children] <- TRUE
+    stack <- children
+  }
+
+  unique(desc)
+}
+
+
+score_downstream <- function(de_list,
+                             A,
+                             exp_design,
+                             step = NULL,
+                             top_x = NULL,
+                             exp_subset = NULL) {
+
+  genes <- colnames(exp_design)
+  gene_to_idx <- setNames(seq_along(genes), genes)
+  N_nodes <- length(genes)
+
+  lambda <- 2 / N_nodes   # regularization weight
+
+  exps <- names(de_list)
+  if (!is.null(exp_subset)) {
+    exps <- intersect(exps, exp_subset)
+  }
+
+  res <- data.frame()
+
+  for (e in exps) {
+
+    dt <- de_list[[e]]
+    if (is.null(dt) || !nrow(dt)) next
+
+    if (!is.null(top_x)) {
+      dt <- head(dt, top_x)
+    }
+
+    ## true DEGs
+    S_true <- dt$gene
+
+    ## perturbed nodes
+    pert_genes <- colnames(exp_design)[exp_design[e, ] != 0]
+    pert_idx <- gene_to_idx[pert_genes]
+
+    ## downstream
+    S_down_idx <- if (is.null(step)) {
+      all_downstream(A, pert_idx)
+    } else {
+      k_hop_descendants(A, pert_idx, k = step)
+    }
+
+    S_down_idx <- setdiff(S_down_idx, pert_idx)
+    S_down <- genes[S_down_idx]
+
+    ## causal violation
+    n_miss <- length(setdiff(S_true, S_down))
+    miss_rate <- if (length(S_true) == 0) NA_real_ else n_miss / length(S_true)
+
+    ## redundancy mass (not normalized on purpose)
+    n_noise <- length(setdiff(S_down, S_true))
+
+    neg_score <- miss_rate + lambda * n_noise
+
+    res <- rbind(
+      res,
+      data.frame(
+        experiment = e,
+        step = ifelse(is.null(step), "all", step),
+        top_x = length(S_true),
+        miss_rate = miss_rate,
+        noise_mass = n_noise,
+        lambda = lambda,
+        negative_score = neg_score,
+        stringsAsFactors = FALSE
+      )
+    )
+  }
+
+  res
+}
+```
+
+
+
+
+```{r}
+top_x_vals <- seq(10, 30, by = 10)
+
+neg_scores <- lapply(top_x_vals, function(tx) {
+
+  t_res <- score_downstream(
+    de_top200_q50,
+    adj_truth,
+    exp_design,
+    step = 1,
+    top_x = tx,
+    exp_subset = test_exp
+  ) %>%
+    mutate(group = "Truth")
+
+  r_res <- score_downstream(
+    de_top200_q50,
+    random_adj,
+    exp_design,
+    step = 1,
+    top_x = tx,
+    exp_subset = test_exp
+  ) %>%
+    mutate(group = "Random")
+
+  bind_rows(t_res, r_res)
+}) %>%
+  bind_rows()
+
+summary_stats <- neg_scores %>%
+  group_by(group) %>%
+  summarise(
+    mean_score = mean(negative_score, na.rm = TRUE),
+    median_score = median(negative_score, na.rm = TRUE),
+    .groups = "drop"
+  )
+
+pvals <- neg_scores %>%
+  group_by(top_x) %>%
+  summarise(
+    p_value = {
+      truth_scores  <- negative_score[group == "Truth"]
+      random_scores <- negative_score[group == "Random"]
+
+      if (length(truth_scores) > 0 && length(random_scores) > 0) {
+        wilcox.test(
+          x = truth_scores,
+          y = random_scores,
+          alternative = "less"
+        )$p.value
+      } else {
+        NA_real_
+      }
+    },
+    .groups = "drop"
+  ) %>%
+  mutate(
+    p_label = paste0("p = ", formatC(p_value, format = "f", digits = 3))
+  )
+
+annot_pos <- neg_scores %>%
+  group_by(top_x) %>%
+  summarise(
+    x = "Random",  # 右侧 box
+    y = min(negative_score, na.rm = TRUE),
+    .groups = "drop"
+  ) %>%
+  left_join(pvals, by = "top_x")
+
+p <- ggplot(
+  neg_scores,
+  aes(x = group, y = negative_score, fill = group)
+) +
+  geom_boxplot(
+    outlier.shape = NA,
+    width = 0.6,
+    alpha = 0.7
+  ) +
+  geom_jitter(
+    width = 0.15,
+    size = 0.8,
+    alpha = 0.4
+  ) +
+  facet_wrap(
+    ~ top_x,
+    nrow = 2,
+    ncol = 3,
+    scales = "free_y",
+    labeller = labeller(top_x = function(x) paste0("Top X = ", x))
+  ) +
+  scale_fill_manual(
+    values = c(
+      "Truth"  = "#1b9e77",
+      "Random" = "#d95f02"
+    )
+  ) +
+  geom_text(
+    data = annot_pos,
+    aes(x = x, y = y, label = p_label),
+    inherit.aes = FALSE,
+    hjust = 1,
+    vjust = -0.3,
+    size = 4
+  ) +
+  theme_bw(base_size = 16) +
+  theme(
+    legend.position = "top",
+    strip.background = element_rect(fill = "grey90"),
+    strip.text = element_text(face = "bold"),
+    axis.title.x = element_blank()
+  ) +
+  ylab("Causal Reach Violation with Penalized redundancy") +
+  ggtitle("Causal Reach Violation\nOne-sided Wilcoxon: Truth < Random")
+
+print(p)
+```
+
+
+
+```{r}
+png("/nfs/turbo/umms-welchjd-code/code/wzqian/Casualformer/dyngen/20250709_branching_8kd/figures/CRV_penalty_redundancy_true_vs_random_top10_30_q50_step1_test_exp.png", heigh = 4000, width = 6000,res = 300)
+print(p)
+dev.off()
+
+```
+
+#################################################################################################################################################################
+# just penalize the mean-out degree
+
+```{r}
+score_downstream <- function(de_list,
+                             A,
+                             exp_design,
+                             step = NULL,
+                             top_x = NULL,
+                             exp_subset = NULL) {
+
+  genes <- colnames(exp_design)
+  gene_to_idx <- setNames(seq_along(genes), genes)
+  N_nodes <- length(genes)
+
+  ## base regularization weight
+  lambda_base <- 2 / N_nodes
+
+  ## graph-wide mean out-degree (overall connectivity level)
+  mean_degree <- mean(rowSums(A))
+
+  ## effective penalty strength
+  lambda <- lambda_base * mean_degree
+
+  exps <- names(de_list)
+  if (!is.null(exp_subset)) {
+    exps <- intersect(exps, exp_subset)
+  }
+
+  res <- data.frame()
+
+  for (e in exps) {
+
+    dt <- de_list[[e]]
+    if (is.null(dt) || !nrow(dt)) next
+
+    if (!is.null(top_x)) {
+      dt <- head(dt, top_x)
+    }
+
+    ## true DEGs
+    S_true <- dt$gene
+
+    ## perturbed nodes
+    pert_genes <- colnames(exp_design)[exp_design[e, ] != 0]
+    pert_idx <- gene_to_idx[pert_genes]
+
+    ## downstream set
+    S_down_idx <- if (is.null(step)) {
+      all_downstream(A, pert_idx)
+    } else {
+      k_hop_descendants(A, pert_idx, k = step)
+    }
+
+    S_down_idx <- setdiff(S_down_idx, pert_idx)
+    S_down <- genes[S_down_idx]
+
+    ## causal violation
+    n_miss <- length(setdiff(S_true, S_down))
+    miss_rate <- if (length(S_true) == 0) NA_real_ else n_miss / length(S_true)
+
+    ## redundancy / noise mass
+    n_noise <- length(setdiff(S_down, S_true))
+
+    ## regularized score
+    neg_score <- miss_rate + lambda 
+
+    res <- rbind(
+      res,
+      data.frame(
+        experiment = e,
+        step = ifelse(is.null(step), "all", step),
+        top_x = length(S_true),
+        miss_rate = miss_rate,
+        noise_mass = n_noise,
+        mean_degree = mean_degree,
+        lambda = lambda,
+        negative_score = neg_score,
+        stringsAsFactors = FALSE
+      )
+    )
+  }
+
+  res
+}
+```
+
+
+
+```{r}
+top_x_vals <- seq(10, 30, by = 10)
+
+neg_scores <- lapply(top_x_vals, function(tx) {
+
+  t_res <- score_downstream(
+    de_top200_q50,
+    adj_truth,
+    exp_design,
+    step = 1,
+    top_x = tx,
+    exp_subset = test_exp
+  ) %>%
+    mutate(group = "Truth")
+
+  r_res <- score_downstream(
+    de_top200_q50,
+    random_adj,
+    exp_design,
+    step = 1,
+    top_x = tx,
+    exp_subset = test_exp
+  ) %>%
+    mutate(group = "Random")
+
+  bind_rows(t_res, r_res)
+}) %>%
+  bind_rows()
+
+summary_stats <- neg_scores %>%
+  group_by(group) %>%
+  summarise(
+    mean_score = mean(negative_score, na.rm = TRUE),
+    median_score = median(negative_score, na.rm = TRUE),
+    .groups = "drop"
+  )
+
+pvals <- neg_scores %>%
+  group_by(top_x) %>%
+  summarise(
+    p_value = {
+      truth_scores  <- negative_score[group == "Truth"]
+      random_scores <- negative_score[group == "Random"]
+
+      if (length(truth_scores) > 0 && length(random_scores) > 0) {
+        wilcox.test(
+          x = truth_scores,
+          y = random_scores,
+          alternative = "less"
+        )$p.value
+      } else {
+        NA_real_
+      }
+    },
+    .groups = "drop"
+  ) %>%
+  mutate(
+    p_label = paste0("p = ", formatC(p_value, format = "f", digits = 3))
+  )
+
+annot_pos <- neg_scores %>%
+  group_by(top_x) %>%
+  summarise(
+    x = "Random",  # 右侧 box
+    y = min(negative_score, na.rm = TRUE),
+    .groups = "drop"
+  ) %>%
+  left_join(pvals, by = "top_x")
+
+p <- ggplot(
+  neg_scores,
+  aes(x = group, y = negative_score, fill = group)
+) +
+  geom_boxplot(
+    outlier.shape = NA,
+    width = 0.6,
+    alpha = 0.7
+  ) +
+  geom_jitter(
+    width = 0.15,
+    size = 0.8,
+    alpha = 0.4
+  ) +
+  facet_wrap(
+    ~ top_x,
+    nrow = 2,
+    ncol = 3,
+    scales = "free_y",
+    labeller = labeller(top_x = function(x) paste0("Top X = ", x))
+  ) +
+  scale_fill_manual(
+    values = c(
+      "Truth"  = "#1b9e77",
+      "Random" = "#d95f02"
+    )
+  ) +
+  geom_text(
+    data = annot_pos,
+    aes(x = x, y = y, label = p_label),
+    inherit.aes = FALSE,
+    hjust = 1,
+    vjust = -0.3,
+    size = 4
+  ) +
+  theme_bw(base_size = 16) +
+  theme(
+    legend.position = "top",
+    strip.background = element_rect(fill = "grey90"),
+    strip.text = element_text(face = "bold"),
+    axis.title.x = element_blank()
+  ) +
+  ylab("Causal Reach Violation, Penalized mean out-degree") +
+  ggtitle("Causal Reach Violation\nOne-sided Wilcoxon: Truth < Random")
+
+print(p)
+```
+```{r}
+png("/nfs/turbo/umms-welchjd-code/code/wzqian/Casualformer/dyngen/20250709_branching_8kd/figures/CRVpm_true_vs_random_top10_30_q50_step1.png", heigh = 4000, width = 6000,res = 300)
+print(p)
+dev.off()
+
+```
+
+
+
+
+
+```{r}
+correct_low  <- c(0.20, 0.40, 0.60, 0.80)
+correct_high <- c(0.90, 0.93, 0.96)
+
+top_x_vals <- seq(10, 30, by = 10)
+
+partial_graphs_low <- lapply(correct_low, function(frac)
+  make_partial_graph(adj_truth, frac, seed = 1)
+)
+names(partial_graphs_low) <- paste0(correct_low * 100, "%")
+
+partial_graphs_high <- lapply(correct_high, function(frac)
+  make_partial_graph(adj_truth, frac, seed = 1)
+)
+names(partial_graphs_high) <- paste0(correct_high * 100, "%")
+
+```
+
+
+
+
+
+
+
+```{r}
+calc_scores_for_graphs <- function(graph_list,
+                                   de_list,
+                                   exp_design,
+                                   top_x_vals,
+                                   exp_subset = NULL,
+                                   step = NULL,
+                                   graph_group = NULL) {
+  # graph_list: named list of adjacency matrices
+  # de_list: list of DE tables by experiment
+  # exp_design: design matrix (rows=experiments, cols=genes)
+  # top_x_vals: vector, e.g. seq(10, 50, by = 10)
+  # exp_subset: optional vector of experiment names
+  # step: NULL means all upstream (as in your score_negative_upstream)
+  # graph_group: optional label for grouping, e.g. "low"/"high"
+
+  dplyr::bind_rows(lapply(names(graph_list), function(name) {
+    A <- graph_list[[name]]
+
+    dplyr::bind_rows(lapply(top_x_vals, function(tx) {
+      score_downstream(
+        de_list   = de_list,
+        A         = A,
+        exp_design = exp_design,
+        step      = step,
+        top_x     = tx,
+        exp_subset = exp_subset
+      ) %>%
+        dplyr::mutate(
+          graph = name,
+          graph_group = graph_group,
+          top_x = tx
+        )
+    }))
+  }))
+}
+```
+
+
+```{r}
+top_x_vals <- seq(10, 30, by = 10)
+
+scores_low <- calc_scores_for_graphs(
+  graph_list  = partial_graphs_low,
+  de_list     = de_top200_q50,
+  exp_design  = exp_design,
+  top_x_vals  = top_x_vals,
+  exp_subset  = test_exp,
+  step        = 1,
+  graph_group = "low"
+)
+
+scores_high <- calc_scores_for_graphs(
+  graph_list  = partial_graphs_high,
+  de_list     = de_top200_q50,
+  exp_design  = exp_design,
+  top_x_vals  = top_x_vals,
+  exp_subset  = test_exp,
+  step        = 1,
+  graph_group = "high"
+)
+scores_truth <- lapply(top_x_vals, function(tx) {
+  score_downstream(
+    de_top200_q50,
+    adj_truth,
+    exp_design,
+    step = 1,
+    top_x = tx,
+    exp_subset = test_exp
+  ) %>%
+    dplyr::mutate(
+      graph = "Truth",
+      top_x = tx
+    )
+}) %>% dplyr::bind_rows()
+```
+
+
+
+```{r}
+partial_scores <- scores_low %>%
+  dplyr::rename(partial = graph)
+wide_low <- partial_scores %>%
+  dplyr::left_join(
+    scores_truth %>%
+      dplyr::select(experiment, top_x, Truth = negative_score),
+    by = c("experiment", "top_x")
+  ) %>%
+  dplyr::rename(Partial = negative_score)
+
+
+```
+
+```{r}
+pvals_low <- wide_low %>%
+  dplyr::filter(!is.na(Truth), !is.na(Partial)) %>%
+  dplyr::group_by(top_x, partial) %>%
+  dplyr::summarise(
+    p_value = wilcox.test(
+      x = Truth,
+      y = Partial,
+      paired = TRUE,
+      alternative = "less"
+    )$p.value,
+    .groups = "drop"
+  ) %>%
+  dplyr::mutate(
+    p_label = paste0("p = ", formatC(p_value, format = "f", digits = 3))
+  )
+```
+
+
+
+
+
+```{r}
+truth_expanded <- scores_truth %>%
+  dplyr::select(-graph) %>%                      # remove old "graph" to avoid name conflict
+  tidyr::crossing(
+    graph = unique(scores_low$graph)             # "20%" "40%" "60%" "80%"
+  ) %>%
+  dplyr::mutate(group = "Truth")
+
+# --- 2) Partial scores ---
+partial_plot <- scores_low %>%
+  dplyr::mutate(group = "Partial")
+
+# --- 3) Combine for plotting ---
+scores_low_plot <- dplyr::bind_rows(
+  truth_expanded,
+  partial_plot
+) %>%
+  dplyr::mutate(
+    group = factor(group, levels = c("Truth", "Partial")),
+    top_x = factor(top_x, levels = top_x_vals),
+    graph = factor(graph, levels = unique(scores_low$graph))  # keep column order stable
+  )
+
+# --- 4) p-value annotation (bottom-right of each panel) ---
+pvals_low_annot <- pvals_low %>%
+  dplyr::mutate(
+    top_x = factor(top_x, levels = top_x_vals),
+    graph = factor(partial, levels = levels(scores_low_plot$graph)),
+    x = "Partial",
+    y = 0
+  )
+
+# --- 5) Plot: 5 (top_x) × 4 (partial%) panels, each panel has 2 groups ---
+p_low <- ggplot(
+  scores_low_plot,
+  aes(x = group, y = negative_score, fill = group)
+) +
+  geom_boxplot(
+    outlier.shape = NA,
+    width = 0.6,
+    alpha = 0.7
+  ) +
+  geom_jitter(
+    width = 0.15,
+    size = 0.7,
+    alpha = 0.4
+  ) +
+  facet_grid(
+    top_x ~ graph,
+    scales = "fixed"
+  ) +
+  scale_fill_manual(
+    values = c(
+      "Truth"   = "#1b9e77",
+      "Partial" = "#d95f02"
+    )
+  ) +
+  coord_cartesian(ylim = c(0, 1)) +
+  geom_text(
+    data = pvals_low_annot,
+    aes(x = x, y = y, label = p_label),
+    inherit.aes = FALSE,
+    hjust = 1.05,
+    vjust = -0.2,
+    size = 3.5
+  ) +
+  theme_bw(base_size = 15) +
+  theme(
+    legend.position = "top",
+    strip.background = element_rect(fill = "grey90"),
+    strip.text = element_text(face = "bold"),
+    axis.title.x = element_blank()
+  ) +
+  ylab("CRV,Penalized mean out-degree") +
+  ggtitle("Truth vs Partial-correct graphs (20–80%)\nPaired Wilcoxon (per panel): Truth < Partial")
+
+print(p_low)
+```
+
+```{r}
+png("/nfs/turbo/umms-welchjd-code/code/wzqian/Casualformer/dyngen/20250709_branching_8kd/figures/CRVm_true_vs_partial_low_top10_30_q50_step1.png", heigh = 4000, width = 6000,res = 300)
+print(p_low)
+dev.off()
+
+```
+
+
+
+# for high version
+
+```{r}
+partial_scores <- scores_high %>%
+  dplyr::rename(partial = graph)
+wide_high <- partial_scores %>%
+  dplyr::left_join(
+    scores_truth %>%
+      dplyr::select(experiment, top_x, Truth = negative_score),
+    by = c("experiment", "top_x")
+  ) %>%
+  dplyr::rename(Partial = negative_score)
+
+
+```
+
+
+```{r}
+pvals_high <- wide_high %>%
+  dplyr::filter(!is.na(Truth), !is.na(Partial)) %>%
+  dplyr::group_by(top_x, partial) %>%
+  dplyr::summarise(
+    p_value = wilcox.test(
+      x = Truth,
+      y = Partial,
+      paired = TRUE,
+      alternative = "less"
+    )$p.value,
+    .groups = "drop"
+  ) %>%
+  dplyr::mutate(
+    p_label = paste0("p = ", formatC(p_value, format = "f", digits = 3))
+  )
+```
+
+
+```{r}
+truth_expanded <- scores_truth %>%
+  dplyr::select(-graph) %>%                      # remove old "graph" to avoid name conflict
+  tidyr::crossing(
+    graph = unique(scores_high$graph)             # "20%" "40%" "60%" "80%"
+  ) %>%
+  dplyr::mutate(group = "Truth")
+
+# --- 2) Partial scores ---
+partial_plot_h <- scores_high %>%
+  dplyr::mutate(group = "Partial")
+
+# --- 3) Combine for plotting ---
+scores_high_plot <- dplyr::bind_rows(
+  truth_expanded,
+  partial_plot_h
+) %>%
+  dplyr::mutate(
+    group = factor(group, levels = c("Truth", "Partial")),
+    top_x = factor(top_x, levels = top_x_vals),
+    graph = factor(graph, levels = unique(scores_high$graph))  # keep column order stable
+  )
+
+# --- 4) p-value annotation (bottom-right of each panel) ---
+pvals_high_annot <- pvals_high %>%
+  dplyr::mutate(
+    top_x = factor(top_x, levels = top_x_vals),
+    graph = factor(partial, levels = levels(scores_high_plot$graph)),
+    x = "Partial",
+    y = 0
+  )
+
+# --- 5) Plot: 5 (top_x) × 4 (partial%) panels, each panel has 2 groups ---
+p_high <- ggplot(
+  scores_high_plot,
+  aes(x = group, y = negative_score, fill = group)
+) +
+  geom_boxplot(
+    outlier.shape = NA,
+    width = 0.6,
+    alpha = 0.7
+  ) +
+  geom_jitter(
+    width = 0.15,
+    size = 0.7,
+    alpha = 0.4
+  ) +
+  facet_grid(
+    top_x ~ graph,
+    scales = "fixed"
+  ) +
+  scale_fill_manual(
+    values = c(
+      "Truth"   = "#1b9e77",
+      "Partial" = "#d95f02"
+    )
+  ) +
+  coord_cartesian(ylim = c(0, 1)) +
+  geom_text(
+    data = pvals_high_annot,
+    aes(x = x, y = y, label = p_label),
+    inherit.aes = FALSE,
+    hjust = 1.05,
+    vjust = -0.2,
+    size = 3.5
+  ) +
+  theme_bw(base_size = 15) +
+  theme(
+    legend.position = "top",
+    strip.background = element_rect(fill = "grey90"),
+    strip.text = element_text(face = "bold"),
+    axis.title.x = element_blank()
+  ) +
+  ylab("CRV,Penalized mean out-degree") +
+  ggtitle("Truth vs Partial-correct graphs (90-93%)\nPaired Wilcoxon (per panel): Truth < Partial")
+
+print(p_high)
+```
+```{r}
+png("/nfs/turbo/umms-welchjd-code/code/wzqian/Casualformer/dyngen/20250709_branching_8kd/figures/CRVm_true_vs_partial_hight_top10_30_q50_step1.png", heigh = 4000, width = 6000,res = 300)
+print(p_high)
+dev.off()
+
+```
+
+
+
+
+```{r}
+correct_fracs <- seq(0.01, 1, by = 0.05)
+n_rep <- 10
+step_vals <- c(1, 2, 3)
+tx_vals <- c(10, 20, 30)
+
+results <- list()
+
+for (cf in correct_fracs) {
+  for (r in seq_len(n_rep)) {
+
+    A_part <- make_partial_graph(adj_truth, cf, seed = r)
+
+    for (st in step_vals) {
+      for (tx in tx_vals) {
+
+        sc <- score_downstream(
+          de_top200_q50,
+          A_part,
+          exp_design,
+          step = st,
+          top_x = tx,
+          exp_subset = test_exp
+        )
+
+        results[[length(results) + 1]] <- sc %>%
+          mutate(
+            correct_frac = cf,
+            rep = r,
+            step = st,
+            top_x = tx
+          )
+      }
+    }
+  }
+}
+
+sens_df <- bind_rows(results)
+
+```
+
+```{r}
+
+
+p <- ggplot(sens_df, aes(correct_frac, negative_score)) +
+  geom_point(alpha = 0.3) +
+  geom_smooth(se = TRUE) +
+  facet_grid(step ~ top_x) +
+    theme_bw(base_size = 15) +
+  theme(
+    legend.position = "top",
+    strip.background = element_rect(fill = "grey90"),
+    strip.text = element_text(face = "bold"),
+    axis.title.x = element_blank()
+  ) +
+  ylab("Penalized Causal Reach Violation (mean out-degree)") 
+
+print(p)
+
+```
+
+```{r}
+png("/nfs/turbo/umms-welchjd-code/code/wzqian/Casualformer/dyngen/20250709_branching_8kd/figures/CRVm_sensitvity_sweep.png", heigh = 4000, width = 6000,res = 300)
+print(p)
+dev.off()
+
+```
+
+
+```{r}
+sens_df$correct_frac_f <- factor(
+  sens_df$correct_frac,
+  levels = sort(unique(sens_df$correct_frac))
+)
+
+p <- ggplot(
+  sens_df,
+  aes(x = correct_frac_f, y = negative_score)
+) +
+  geom_boxplot(
+    outlier.shape = NA,
+    width = 0.7,
+    alpha = 0.75
+  ) +
+  geom_jitter(
+    width = 0.15,
+    size = 0.6,
+    alpha = 0.35
+  ) +
+  facet_grid(step ~ top_x) +
+  theme(
+    legend.position = "top",
+    strip.background = element_rect(fill = "grey90"),
+    strip.text = element_text(face = "bold"),
+    axis.text.x = element_text(angle = 45, hjust = 1),
+    axis.title.x = element_blank()
+  ) +
+  ylab("Penalized Causal Reach Violation (mean out-degree)") +
+  xlab("Fraction of correct edges")
+
+print(p)
+```
+
+
+```{r}
+png("/nfs/turbo/umms-welchjd-code/code/wzqian/Casualformer/dyngen/20250709_branching_8kd/figures/CRVm_sensitvity_sweepbox.png", heigh = 4000, width = 6000,res = 300)
+print(p)
+dev.off()
+
+```
+
+
+```{r}
+ box_stats <- sens_df %>%
+  group_by(step, top_x, correct_frac) %>%
+  summarise(
+    mean_score   = mean(negative_score, na.rm = TRUE),
+    median_score = median(negative_score, na.rm = TRUE),
+    max_score    = max(negative_score, na.rm = TRUE),
+    min_score    = min(negative_score, na.rm = TRUE),
+    .groups = "drop"
+  ) %>%
+  arrange(step, top_x, correct_frac)
+```
+
+```{r}
+box_deltas <- box_stats %>%
+  group_by(step, top_x) %>%
+  mutate(
+    mean_delta   = mean_score   - lag(mean_score),
+    median_delta = median_score - lag(median_score),
+    max_delta    = max_score    - lag(max_score),
+    min_delta    = min_score    - lag(min_score),
+    x_frac = correct_frac
+  ) %>%
+  filter(!is.na(mean_delta)) %>%
+  ungroup()
+```
+
+```{r}
+central_long <- box_deltas %>%
+  pivot_longer(
+    cols = c(mean_delta, median_delta),
+    names_to = "stat",
+    values_to = "delta"
+  )
+
+p1 <- ggplot(central_long, aes(x = x_frac, y = delta, color = stat)) +
+  geom_line(linewidth = 1.1) +
+  geom_point(size = 1.8) +
+  facet_grid(step ~ top_x) +
+  theme_bw(base_size = 15) +
+  theme(
+    legend.position = "top",
+    strip.background = element_rect(fill = "grey90"),
+    strip.text = element_text(face = "bold")
+  ) +
+  xlab("Larger edge-correctness fraction") +
+  ylab("Δ summary statistic (CRVm)") +
+  ggtitle("Consecutive edge-correctness differences: mean & median")
+
+print(p1)
+```
+```{r}
+png("/nfs/turbo/umms-welchjd-code/code/wzqian/Casualformer/dyngen/20250709_branching_8kd/figures/CRVm_sensitvity_sweep_mean_median_diff.png", heigh = 4000, width = 6000,res = 300)
+print(p1)
+dev.off()
+
+```
+
+
+
+```{r}
+extreme_long <- box_deltas %>%
+  pivot_longer(
+    cols = c(max_delta, min_delta),
+    names_to = "stat",
+    values_to = "delta"
+  )
+
+p2 <- ggplot(extreme_long, aes(x = x_frac, y = delta, color = stat)) +
+  geom_line(linewidth = 1.1) +
+  geom_point(size = 1.8) +
+  facet_grid(step ~ top_x) +
+  theme_bw(base_size = 15) +
+  theme(
+    legend.position = "top",
+    strip.background = element_rect(fill = "grey90"),
+    strip.text = element_text(face = "bold")
+  ) +
+  xlab("Larger edge-correctness fraction") +
+  ylab("Δ summary statistic (CRVm)") +
+  ggtitle("Consecutive edge-correctness : max & min")
+
+print(p2)
+```
+
+```{r}
+png("/nfs/turbo/umms-welchjd-code/code/wzqian/Casualformer/dyngen/20250709_branching_8kd/figures/CRVm_sensitvity_sweep_minmax_diff.png", heigh = 4000, width = 6000,res = 300)
+print(p2)
+dev.off()
+
+```

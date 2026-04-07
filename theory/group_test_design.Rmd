@@ -1,0 +1,130 @@
+---
+title: "group_test_design"
+output: html_document
+date: "2025-05-08"
+---
+```{r}
+library(ggplot2)
+library(dplyr)
+library(tidyr)
+library(purrr)
+```
+
+```{r}
+
+lower_bound_T <- function(k_vals, V_vals, ntf = 1500, p_suc = 1) {
+  sparsity_levels <- c(0.01, 0.05, seq(0.1, 0.9, by = 0.1))
+  results <- list()
+  
+  for (V in V_vals) {
+    N <- ntf * (V - 1)  # allowed number of directed edges
+    for (k in k_vals) {
+      df <- data.frame(
+        sparsity = sparsity_levels,
+        E = round(sparsity_levels * N),
+        T_bound = NA,
+        k = k,
+        V = V
+      )
+      
+      df$T_bound <- map2_dbl(df$E, N, function(E, N_total) {
+        if (E == 0 || E >= N_total) {
+          return(NA)
+        } else {
+          log_binom <- lgamma(N_total + 1) - lgamma(E + 1) - lgamma(N_total - E + 1)
+          return(ceiling(log_binom / log(2) / (V - k)))
+        }
+      })
+      results[[paste0("V", V, "_k", k)]] <- df
+    }
+  }
+  
+  final_df <- bind_rows(results, .id = "setting")
+  print(final_df)
+  
+  ggplot(final_df, aes(x = sparsity, y = T_bound, color = setting)) +
+    geom_line(size = 0.5) +
+    geom_point(size = 2) +
+    labs(
+      title = "Information-Theoretic Lower Bound on Number of Experiments (T)",
+      x = "Sparsity (|E| / N)",
+      y = "Lower Bound on T",
+      color = "Setting (V & k)"
+    ) +
+    theme_minimal() +
+    theme(text = element_text(size = 12))
+}
+
+```
+
+
+```{r}
+lower_bound_T(k_vals = c(1, 2, 4,8), V_vals = c(1500))
+```
+```{r}
+plot_success_prob <- function(k_vals, V_vals, ntf = 1500, sparsity = 0.05, T_range = 100:300) {
+  results <- list()
+
+  for (V in V_vals) {
+    N <- ntf * (V - 1)
+    for (k in k_vals) {
+      E <- round(sparsity * N)  # fixed sparsity level
+      log2_binom <- (lgamma(N + 1) - lgamma(E + 1) - lgamma(N - E + 1)) / log(2)
+      
+      df <- data.frame(
+        T = T_range,
+        log2_binom = log2_binom,
+        log2_p_suc = T_range * (V - k) - log2_binom,
+        k = k,
+        V = V
+      )
+      df$p_suc <- pmin(1, 2^df$log2_p_suc)  # safe exponentiation, capped at 1
+      results[[paste0("V", V, "_k", k)]] <- df
+    }
+  }
+
+  final_df <- bind_rows(results, .id = "setting")
+  print(final_df)
+
+  ggplot(final_df, aes(x = T, y = p_suc, color = setting)) +
+    geom_line(size = 1.1) +
+    labs(
+      title = paste0("Success Probability vs Number of Experiments (Sparsity = ", sparsity, ")"),
+      x = "Number of Experiments T",
+      y = "Upper Bound on Success Probability",
+      color = "Setting (V & k)"
+    ) +
+    theme_minimal() +
+    ylim(0, 1.05) +
+    theme(text = element_text(size = 12))
+}
+
+```
+
+
+```{r}
+plot_success_prob(k_val1s = c(1, 2, 4,8), V_vals = c(1500), sparsity = 0.05, T_range = 300:500)
+```
+
+```{r}
+lower_bound_T(k_vals = c(8), V_vals = c(250),ntf = 250)
+```
+
+```{r}
+calculate_T_bound <- function(E, N_TF, N_non_TF, V,k, allow_self_regulation = FALSE) {
+  N_total <- N_TF * (N_TF + N_non_TF)
+  if (!allow_self_regulation) {
+    N_total <- N_total - N_TF
+  }
+  
+  if (E == 0 || E >= N_total) {
+    return(NA)
+  }
+  
+  log_binom <- lgamma(N_total + 1) - lgamma(E + 1) - lgamma(N_total - E + 1)
+  T_bound <- ceiling(log_binom / log(2) / (V - k))
+  
+  return(T_bound)
+}
+```
+
