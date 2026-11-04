@@ -1,0 +1,19 @@
+cfg <- list(
+  type                    = "network",
+  template                = "legacy",
+  topology                = "external",
+  topology_file           = "dyngen_cycle",
+  max_repressors_per_gene = 3L,
+  spine_len               = 5L,
+  burn_frac               = 0.10,
+  protein_halflife_scale  = 3,
+  n_cells                 = 100L,
+  n_targets               = 0L,
+  max_nodes               = 8L,
+  hub_top_k               = 100L,
+  hub_min_upstream        = 2L,
+  max_hub_experiments     = 19L,
+  max_chunks_per_hub      = 2L,
+  include_repressors      = FALSE,
+  seed                    = 2125L
+)

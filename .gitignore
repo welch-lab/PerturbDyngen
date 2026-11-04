@@ -1,0 +1,6 @@
+.Rproj.user
+.Rhistory
+.RData
+*.Rcheck/
+perturbdyngen_*.tar.gz
+outputs/

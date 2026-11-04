@@ -1,0 +1,21 @@
+cfg <- list(
+  type               = "dataset",
+  network            = "dyngen_cycle",
+  hub_design         = "pure",
+  perturbation       = "activation",
+  levels             = c(2, 5, 10),
+  experiments        = "all",
+  n_sims             = 300L,
+  seed               = 2025L,
+  pre_kd_window      = 0.05,
+  snap_time          = "last",
+  guide_sigma_s2     = 0.1,
+  guide_nb_theta     = 10,
+  sigmoid_k          = 0.01484,
+  sigmoid_u0         = 143.4,
+  umi_capture_rate   = 0.9,
+  act_guide_kd_equiv = 0.2,
+  p_rna              = 0.05,
+  p_premrna          = 0.01,
+  rna_nb_theta       = 3
+)

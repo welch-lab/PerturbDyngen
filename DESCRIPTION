@@ -1,0 +1,35 @@
+Package: perturbdyngen
+Type: Package
+Title: Paired Perturb-seq Simulation of Gene Regulatory Networks
+Version: 0.1.0
+Authors@R: person("Weizhou", "Qian", role = c("aut", "cre"),
+    email = "78060663+cyclopenta@users.noreply.github.com")
+Description: Simulates knockdown (CRISPRi) and activation (CRISPRa) Perturb-seq
+    screens on dyngen gene regulatory network models. Wild-type and perturbed cells
+    are simulated as coupled pairs with common random numbers, so genes upstream of a
+    perturbation are unchanged by construction. A guide UMI layer and an RNA capture
+    layer (shared library size, negative binomial counts) turn molecule counts into
+    Perturb-seq-like observations. Includes a network sampler (log-normal degrees,
+    burn-in scaffolding, reachability repair), experiment designs, the networks and
+    configuration files of the CausalODE benchmark, and AnnData export.
+License: file LICENSE
+Encoding: UTF-8
+Depends: R (>= 4.1)
+Imports:
+    dyngen (>= 1.0.5),
+    GillespieSSA2 (>= 0.3.0),
+    Matrix,
+    methods,
+    dplyr,
+    tibble,
+    igraph,
+    parallel,
+    stats,
+    utils,
+    grDevices
+Suggests:
+    anndata,
+    reticulate,
+    testthat (>= 3.0.0)
+Config/testthat/edition: 3
+RoxygenNote: 7.3.2
